@@ -416,6 +416,89 @@ impl Probe {
             snapshot_corrupted,
         }
     }
+
+    /// Sweep opcodes with full GPR snapshots, writing each result to a sink.
+    ///
+    /// Returns a [`SweepSummary`] and whether the sweep was interrupted by Ctrl+C.
+    /// The sweep checks [`was_interrupted`] after each probe and stops early if set.
+    ///
+    /// Progress is printed every `progress_interval` opcodes.
+    pub fn observed_sweep(
+        &self,
+        opcodes: impl Iterator<Item = u32>,
+        sink: &mut crate::sink::ResultSink,
+        progress_interval: usize,
+    ) -> (SweepSummary, bool) {
+        use crate::signal_handler::was_interrupted;
+
+        let start = Instant::now();
+        let mut ok = 0usize;
+        let mut faulted = 0usize;
+        let mut timed_out = 0usize;
+        let mut segfaulted = 0usize;
+        let mut trapped = 0usize;
+        let mut total = 0usize;
+        let mut interrupted = false;
+
+        for opcode in opcodes {
+            if was_interrupted() {
+                interrupted = true;
+                break;
+            }
+
+            let result = self.run_observed(opcode);
+
+            // Classify.
+            if result.base.timed_out {
+                timed_out += 1;
+            } else if result.base.faulted {
+                faulted += 1;
+            } else if result.base.segfaulted {
+                segfaulted += 1;
+            } else if result.base.trapped {
+                trapped += 1;
+            } else {
+                ok += 1;
+            }
+
+            // Write to sink (best-effort — don't abort sweep on I/O error).
+            if let Err(e) = sink.write(&result) {
+                eprintln!("warning: sink write failed: {e}");
+            }
+
+            total += 1;
+
+            if progress_interval > 0 && total % progress_interval == 0 {
+                let elapsed = start.elapsed();
+                let rate = total as f64 / elapsed.as_secs_f64();
+                eprint!(
+                    "\r  {total} probed ({ok} ok, {faulted} SIGILL, {segfaulted} SEGV, {trapped} TRAP, {timed_out} TIMEOUT) [{rate:.0} ops/sec]"
+                );
+            }
+        }
+
+        // Final progress line.
+        if total > 0 {
+            eprintln!();
+        }
+
+        // Flush the sink.
+        if let Err(e) = sink.flush() {
+            eprintln!("warning: sink flush failed: {e}");
+        }
+
+        let summary = SweepSummary {
+            total,
+            ok,
+            faulted,
+            timed_out,
+            segfaulted,
+            trapped,
+            elapsed: start.elapsed(),
+        };
+
+        (summary, interrupted)
+    }
 }
 
 impl fmt::Debug for Probe {

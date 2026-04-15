@@ -6,6 +6,7 @@ mod emitter;
 mod jit_page;
 mod probe;
 mod signal_handler;
+mod sink;
 
 use jit_page::JitPage;
 use probe::Probe;
@@ -524,6 +525,149 @@ fn gate_6() {
 }
 
 // ╔══════════════════════════════════════╗
+// ║  Gate 7 — The Data Sink              ║
+// ╚══════════════════════════════════════╝
+
+fn gate_7() {
+    use std::path::Path;
+    use crate::signal_handler::{install_sigint_handler, was_interrupted, clear_interrupted};
+    use crate::sink::ResultSink;
+
+    println!("── gate 7: the data sink ──");
+
+    let output_dir = Path::new("output");
+    std::fs::create_dir_all(output_dir).expect("failed to create output/ directory");
+    let jsonl_path = output_dir.join("gate7_test.jsonl");
+
+    // ── Test A: Write a small observed sweep to JSONL ──
+    {
+        // Clean slate for the test.
+        let _ = std::fs::remove_file(&jsonl_path);
+
+        let probe = Probe::new();
+        let mut sink = ResultSink::new(&jsonl_path).expect("failed to open sink");
+
+        // Sweep the HINT space (NOP neighbourhood): 0xD5032000..0xD5032020 (32 opcodes)
+        // plus some UDF range: 0x00000000..0x00000020 (32 opcodes).
+        // Total: 64 opcodes — quick, predictable results.
+        let opcodes = (0xD503_2000u32..0xD503_2020).chain(0x0000_0000u32..0x0000_0020);
+
+        println!("  writing observed sweep to {}", jsonl_path.display());
+        let (summary, _interrupted) = probe.observed_sweep(opcodes, &mut sink, 32);
+        println!("  {summary}");
+        println!("  total written: {} records", sink.total_written());
+
+        // Verify file exists and has the right number of lines.
+        let line_count = std::fs::read_to_string(&jsonl_path)
+            .expect("read jsonl")
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count();
+        assert_eq!(
+            line_count, 64,
+            "expected 64 JSONL lines, got {line_count}"
+        );
+        println!("  ✓ {line_count} JSON lines written");
+
+        // Verify the last opcode.
+        let last = ResultSink::last_opcode(&jsonl_path);
+        assert_eq!(last, Some(0x1F), "expected last opcode 0x1F, got {last:?}");
+        println!("  ✓ last opcode: 0x{:08X}", last.unwrap());
+
+        // Spot-check: parse the first line.
+        let first_line = std::fs::read_to_string(&jsonl_path)
+            .expect("read")
+            .lines()
+            .next()
+            .expect("at least one line")
+            .to_string();
+        let record: serde_json::Value =
+            serde_json::from_str(&first_line).expect("parse first line");
+        assert_eq!(record["v"], 1, "schema version should be 1");
+        assert_eq!(record["opcode"], "0xD5032000", "first opcode");
+        println!("  ✓ first record: v={}, opcode={}", record["v"], record["opcode"]);
+    }
+    println!();
+
+    // ── Test B: Resume from an existing file ──
+    {
+        // The file from Test A has 64 records (last opcode = 0x1F).
+        // Simulate a resume by reading last_opcode and continuing.
+        let resume_from = ResultSink::last_opcode(&jsonl_path)
+            .map(|op| op + 1)
+            .unwrap_or(0);
+        println!("  resume test: last_opcode + 1 = 0x{resume_from:08X}");
+
+        let probe = Probe::new();
+        let mut sink = ResultSink::new(&jsonl_path).expect("failed to open sink for resume");
+
+        // Append 32 more UDF opcodes.
+        let opcodes = resume_from..(resume_from + 32);
+        let (summary, _) = probe.observed_sweep(opcodes, &mut sink, 0);
+        println!("  appended {} more records", summary.total);
+
+        // Verify total lines.
+        let line_count = std::fs::read_to_string(&jsonl_path)
+            .expect("read jsonl")
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count();
+        assert_eq!(
+            line_count, 96,
+            "expected 96 JSONL lines after resume, got {line_count}"
+        );
+
+        let last = ResultSink::last_opcode(&jsonl_path).unwrap();
+        assert_eq!(last, resume_from + 31);
+        println!("  ✓ resume works: {line_count} total lines, last = 0x{last:08X}");
+    }
+    println!();
+
+    // ── Test C: SIGINT handling ──
+    {
+        install_sigint_handler();
+        clear_interrupted();
+
+        // We can't easily send ourselves SIGINT in an automated test without
+        // disrupting the terminal, so just verify the flag mechanism works.
+        assert!(!was_interrupted(), "should not be interrupted yet");
+        println!("  ✓ SIGINT handler installed, flag is clear");
+        println!("  (manual test: run a large sweep and press Ctrl+C to verify graceful stop)");
+    }
+    println!();
+
+    // ── Test D: Validate JSONL with jq-style parsing ──
+    {
+        // Parse every line to verify the entire file is valid JSON.
+        let content = std::fs::read_to_string(&jsonl_path).expect("read jsonl");
+        let mut valid = 0;
+        let mut invalid = 0;
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<crate::sink::SinkRecord>(line) {
+                Ok(_) => valid += 1,
+                Err(e) => {
+                    eprintln!("  invalid line: {e}");
+                    invalid += 1;
+                }
+            }
+        }
+        assert_eq!(invalid, 0, "all lines should be valid SinkRecords");
+        println!("  ✓ all {valid} lines are valid SinkRecords");
+    }
+    println!();
+
+    // Print file size.
+    let metadata = std::fs::metadata(&jsonl_path).expect("file metadata");
+    let size_kb = metadata.len() as f64 / 1024.0;
+    println!("  output file: {} ({size_kb:.1} KiB)", jsonl_path.display());
+
+    println!("✓ data sink operational — JSONL logging with resume\n");
+}
+
+// ╔══════════════════════════════════════╗
 // ║  Main                                ║
 // ╚══════════════════════════════════════╝
 
@@ -537,4 +681,5 @@ fn main() {
     // and hangs for ~1.3s on the deliberate branch-to-self sweep. Everything it
     // proved is now implicitly exercised by gate_6+.
     gate_6();
+    gate_7();
 }

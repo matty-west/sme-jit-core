@@ -380,6 +380,53 @@ pub fn set_probe_bounds(start: u64, end: u64) {
 }
 
 // ╔══════════════════════════════════════╗
+// ║  SIGINT (Ctrl+C) support             ║
+// ╚══════════════════════════════════════╝
+
+/// Set to `true` by the SIGINT handler when Ctrl+C is pressed.
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+/// Install a `SIGINT` handler that sets the [`INTERRUPTED`] flag.
+///
+/// The handler does *not* longjmp or abort — it simply sets a flag that
+/// sweep loops can poll via [`was_interrupted`].
+///
+/// # Panics
+/// Panics if `sigaction` fails.
+pub fn install_sigint_handler() {
+    // SAFETY: We install a minimal signal handler that only writes to an
+    // atomic bool. The handler is async-signal-safe.
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = sigint_handler as *const () as usize;
+        sa.sa_flags = libc::SA_SIGINFO;
+        libc::sigemptyset(&mut sa.sa_mask);
+
+        let ret = libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+        assert!(ret == 0, "sigaction(SIGINT) failed: {}", *libc::__error());
+    }
+}
+
+/// Minimal `SIGINT` handler — just sets the flag.
+extern "C" fn sigint_handler(
+    _sig: libc::c_int,
+    _info: *mut libc::siginfo_t,
+    _ucontext: *mut libc::c_void,
+) {
+    INTERRUPTED.store(true, Ordering::Relaxed);
+}
+
+/// Check whether Ctrl+C has been pressed since the last call to [`clear_interrupted`].
+pub fn was_interrupted() -> bool {
+    INTERRUPTED.load(Ordering::Relaxed)
+}
+
+/// Clear the interrupted flag.
+pub fn clear_interrupted() {
+    INTERRUPTED.store(false, Ordering::Relaxed);
+}
+
+// ╔══════════════════════════════════════╗
 // ║  Timer helpers                       ║
 // ╚══════════════════════════════════════╝
 

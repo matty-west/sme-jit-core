@@ -1,4 +1,5 @@
 /target
 /planning
 /.github
+/output
 .DS_Store

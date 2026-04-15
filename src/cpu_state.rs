@@ -24,7 +24,7 @@ pub const CANARY_HEAD: u64 = 0xCAFE_BABE_DEAD_F00D;
 pub const CANARY_TAIL: u64 = 0xF00D_CAFE_BABE_DEAD;
 
 /// AArch64 register names for display.
-const GPR_NAMES: [&str; GPR_COUNT] = [
+pub const GPR_NAMES: [&str; GPR_COUNT] = [
     "x0",  "x1",  "x2",  "x3",  "x4",  "x5",  "x6",  "x7",
     "x8",  "x9",  "x10", "x11", "x12", "x13", "x14", "x15",
     "x16", "x17", "x18", "x19", "x20", "x21", "x22", "x23",
@@ -255,8 +255,8 @@ mod tests {
     fn snapshot_buffer_layout() {
         // Verify the gprs offset is where we expect (after the 8-byte canary).
         assert_eq!(SnapshotBuffer::gprs_offset(), 8);
-        // Total size: 8 + 31*8 + 8 = 264 bytes.
-        assert_eq!(std::mem::size_of::<SnapshotBuffer>(), 264);
+        // Content: 8 + 31*8 + 8 = 264 bytes, rounded up to 272 by align(16).
+        assert_eq!(std::mem::size_of::<SnapshotBuffer>(), 272);
     }
 
     #[test]
