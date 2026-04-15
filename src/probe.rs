@@ -23,10 +23,12 @@
 use std::fmt;
 use std::time::Instant;
 
+use crate::cpu_state::{GprSnapshot, RegDiff, SnapshotBuffer, seeded_snapshot};
+use crate::emitter;
 use crate::jit_page::JitPage;
 use crate::signal_handler::{
-    arm_alarm, clear_probe_flags, did_segfault, did_sigill_fire, did_timeout, disarm_alarm,
-    disable_longjmp, enable_longjmp, install_signal_handlers, set_escape_address,
+    arm_alarm, clear_probe_flags, did_segfault, did_sigill_fire, did_timeout, did_trap,
+    disarm_alarm, disable_longjmp, enable_longjmp, install_signal_handlers, set_escape_address,
     sigsetjmp, JMP_BUF,
 };
 
@@ -52,6 +54,8 @@ pub struct ProbeResult {
     pub timed_out: bool,
     /// `true` if the instruction caused a SIGSEGV or SIGBUS (memory fault).
     pub segfaulted: bool,
+    /// `true` if the instruction caused a SIGTRAP (BRK / debug trap).
+    pub trapped: bool,
 }
 
 impl ProbeResult {
@@ -63,6 +67,8 @@ impl ProbeResult {
             "SIGILL"
         } else if self.segfaulted {
             "SEGV"
+        } else if self.trapped {
+            "TRAP"
         } else {
             "ok"
         }
@@ -99,6 +105,8 @@ pub struct SweepSummary {
     pub timed_out: usize,
     /// Number that raised SIGSEGV/SIGBUS.
     pub segfaulted: usize,
+    /// Number that raised SIGTRAP.
+    pub trapped: usize,
     /// Wall-clock duration of the sweep.
     pub elapsed: std::time::Duration,
 }
@@ -112,9 +120,51 @@ impl fmt::Display for SweepSummary {
         };
         write!(
             f,
-            "{} probed: {} ok, {} SIGILL, {} SEGV, {} TIMEOUT ({:.0} ops/sec, {:.3?})",
-            self.total, self.ok, self.faulted, self.segfaulted, self.timed_out, rate, self.elapsed
+            "{} probed: {} ok, {} SIGILL, {} SEGV, {} TRAP, {} TIMEOUT ({:.0} ops/sec, {:.3?})",
+            self.total, self.ok, self.faulted, self.segfaulted, self.trapped, self.timed_out,
+            rate, self.elapsed
         )
+    }
+}
+
+// ╔══════════════════════════════════════╗
+// ║  ObservedProbeResult                 ║
+// ╚══════════════════════════════════════╝
+
+/// The outcome of a probe with full register snapshot.
+///
+/// Extends [`ProbeResult`] with before/after GPR state and a diff.
+#[derive(Debug, Clone)]
+pub struct ObservedProbeResult {
+    /// Basic probe result (opcode, faulted, timed_out, segfaulted).
+    pub base: ProbeResult,
+    /// GPR state just before the probed instruction executed.
+    /// `None` if the snapshot was corrupted.
+    pub pre: Option<GprSnapshot>,
+    /// GPR state just after the probed instruction executed.
+    /// `None` if the instruction faulted/timed out, or snapshot was corrupted.
+    pub post: Option<GprSnapshot>,
+    /// Registers that changed between pre and post.
+    /// Empty if either snapshot is unavailable.
+    pub diff: Vec<RegDiff>,
+    /// `true` if the snapshot canaries were corrupted (unreliable diff).
+    pub snapshot_corrupted: bool,
+}
+
+impl fmt::Display for ObservedProbeResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.base)?;
+        if self.snapshot_corrupted {
+            write!(f, "  [snapshot corrupted]")?;
+        } else if !self.diff.is_empty() {
+            write!(f, "  mutations:")?;
+            for d in &self.diff {
+                write!(f, "\n    {d}")?;
+            }
+        } else if self.base.status() == "ok" {
+            write!(f, "  (no GPR changes)")?;
+        }
+        Ok(())
     }
 }
 
@@ -233,6 +283,7 @@ impl Probe {
             faulted: did_sigill_fire(),
             timed_out: did_timeout(),
             segfaulted: did_segfault(),
+            trapped: did_trap(),
         }
     }
 
@@ -242,10 +293,11 @@ impl Probe {
         let results: Vec<ProbeResult> = opcodes.map(|op| self.run(op)).collect();
         let elapsed = start.elapsed();
 
-        let ok = results.iter().filter(|r| !r.faulted && !r.timed_out && !r.segfaulted).count();
+        let ok = results.iter().filter(|r| !r.faulted && !r.timed_out && !r.segfaulted && !r.trapped).count();
         let faulted = results.iter().filter(|r| r.faulted).count();
         let timed_out = results.iter().filter(|r| r.timed_out).count();
         let segfaulted = results.iter().filter(|r| r.segfaulted).count();
+        let trapped = results.iter().filter(|r| r.trapped).count();
 
         let summary = SweepSummary {
             total: results.len(),
@@ -253,10 +305,116 @@ impl Probe {
             faulted,
             timed_out,
             segfaulted,
+            trapped,
             elapsed,
         };
 
         (results, summary)
+    }
+
+    /// Probe a single opcode with full GPR snapshot (observed mode).
+    ///
+    /// Emits a prelude (save + seed GPRs) → probed opcode → postlude (save + restore + RET)
+    /// into the JIT page, then executes the sequence and diffs the register state.
+    ///
+    /// This is slower than [`Probe::run`] due to the prelude/postlude overhead,
+    /// but captures exactly which registers the instruction modified.
+    pub fn run_observed(&self, opcode: u32) -> ObservedProbeResult {
+        // Allocate snapshot buffers on the stack.
+        let mut buf_pre = SnapshotBuffer::new();
+        let mut buf_post = SnapshotBuffer::new();
+
+        // Emit the full observed sequence into the JIT page:
+        //   prelude → opcode → postlude
+        self.page.make_writable();
+
+        let opcode_offset = emitter::emit_prelude(&self.page, buf_pre.as_mut_ptr());
+        self.page.write_instruction(opcode_offset, opcode);
+        let postlude_offset = opcode_offset + 4;
+        let _end = emitter::emit_postlude(
+            &self.page,
+            postlude_offset,
+            buf_post.as_mut_ptr(),
+            buf_pre.as_mut_ptr(),
+        );
+
+        self.page.make_executable();
+
+        // Set escape address past the sequence (just in case the legacy path fires).
+        set_escape_address(self.page.as_ptr() as u64 + _end as u64);
+
+        // Clear flags, arm timeout.
+        clear_probe_flags();
+        if self.timeout_micros > 0 {
+            arm_alarm(self.timeout_micros);
+        }
+
+        // Use sigsetjmp / siglongjmp for recovery.
+        let ret = sigsetjmp(JMP_BUF.as_mut_ptr(), 1);
+        let _signal_fired = if ret == 0 {
+            enable_longjmp();
+            // SAFETY: The page is in executable mode and contains the full
+            // prelude → opcode → postlude → RET sequence. If the probed
+            // instruction faults or hangs, siglongjmp recovers.
+            unsafe { self.page.call_void(); }
+            disable_longjmp();
+            false
+        } else {
+            disable_longjmp();
+            true
+        };
+
+        if self.timeout_micros > 0 {
+            disarm_alarm();
+        }
+
+        let faulted = did_sigill_fire();
+        let timed_out = did_timeout();
+        let segfaulted = did_segfault();
+        let trapped = did_trap();
+
+        let base = ProbeResult {
+            opcode,
+            faulted,
+            timed_out,
+            segfaulted,
+            trapped,
+        };
+
+        // Extract snapshots and compute diff.
+        // The "pre" for diffing is the known seed values (what the prelude loaded),
+        // NOT the caller's register state saved in buf_pre.
+        let pre_corrupted = !buf_pre.canaries_intact();
+        let post_corrupted = !buf_post.canaries_intact();
+        let snapshot_corrupted = pre_corrupted || post_corrupted;
+
+        let seeds = seeded_snapshot();
+        let post = if faulted || timed_out || segfaulted || trapped {
+            // Post-snapshot is unreliable if the instruction didn't complete normally.
+            None
+        } else {
+            buf_post.to_snapshot()
+        };
+
+        // Diff seeds vs post, but skip x28 (scratch), x29 (FP), x30 (LR)
+        // since those are framework registers, not probed state.
+        let diff = match &post {
+            Some(post_snap) => {
+                seeds.diff(post_snap)
+                    .into_iter()
+                    .filter(|d| d.index < 28) // skip x28, x29, x30
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+
+        ObservedProbeResult {
+            base,
+            pre: Some(seeds),
+            post,
+            diff,
+            snapshot_corrupted,
+        }
     }
 }
 

@@ -82,6 +82,9 @@ static TIMED_OUT: AtomicBool = AtomicBool::new(false);
 /// Set to `true` by the SIGSEGV/SIGBUS handler when a memory fault occurs.
 static SEGFAULT_FIRED: AtomicBool = AtomicBool::new(false);
 
+/// Set to `true` by the SIGTRAP handler when a debug/breakpoint trap occurs.
+static TRAP_FIRED: AtomicBool = AtomicBool::new(false);
+
 /// The "escape address" — points to a RET instruction in the JIT page.
 /// Used by the legacy PC-redirect path (Gate 4 tests).
 static ESCAPE_PC: AtomicU64 = AtomicU64::new(0);
@@ -120,6 +123,7 @@ pub fn install_signal_handlers() {
     install_handler(libc::SIGALRM, sigalrm_handler);
     install_handler(libc::SIGSEGV, sigsegv_handler);
     install_handler(libc::SIGBUS, sigsegv_handler);
+    install_handler(libc::SIGTRAP, sigtrap_handler);
 }
 
 /// Also expose the original name for backward compatibility with Gate 4.
@@ -276,6 +280,25 @@ extern "C" fn sigsegv_handler(
     }
 }
 
+/// `SIGTRAP` handler: set the trap flag and recover.
+///
+/// SIGTRAP is raised by BRK instructions (software breakpoints) and
+/// certain debug-related opcodes.
+extern "C" fn sigtrap_handler(
+    _sig: libc::c_int,
+    _info: *mut libc::siginfo_t,
+    ucontext: *mut libc::c_void,
+) {
+    if USE_LONGJMP.load(Ordering::Relaxed) {
+        TRAP_FIRED.store(true, Ordering::Relaxed);
+        siglongjmp_from_handler();
+    } else {
+        if !is_inside_probe(ucontext) { return; }
+        TRAP_FIRED.store(true, Ordering::Relaxed);
+        redirect_pc_to_escape(ucontext);
+    }
+}
+
 /// Redirect the saved PC in the ucontext to the escape address.
 ///
 /// This is the **legacy** recovery path used by Gate 4 tests (which call
@@ -318,6 +341,7 @@ pub fn clear_probe_flags() {
     SIGILL_FIRED.store(false, Ordering::Relaxed);
     TIMED_OUT.store(false, Ordering::Relaxed);
     SEGFAULT_FIRED.store(false, Ordering::Relaxed);
+    TRAP_FIRED.store(false, Ordering::Relaxed);
 }
 
 /// Also expose the original name for backward compatibility with Gate 4.
@@ -338,6 +362,11 @@ pub fn did_timeout() -> bool {
 /// Check whether `SIGSEGV` or `SIGBUS` fired since the last call to [`clear_probe_flags`].
 pub fn did_segfault() -> bool {
     SEGFAULT_FIRED.load(Ordering::Relaxed)
+}
+
+/// Check whether `SIGTRAP` fired since the last call to [`clear_probe_flags`].
+pub fn did_trap() -> bool {
+    TRAP_FIRED.load(Ordering::Relaxed)
 }
 
 /// Set the bounds of the active JIT page.
