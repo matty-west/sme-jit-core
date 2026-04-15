@@ -223,29 +223,7 @@ const GPRS_OFFSET: usize = SnapshotBuffer::gprs_offset();
 /// - `buf_pre_ptr`: Pointer to the `SnapshotBuffer` for the pre-probe dump.
 pub fn emit_prelude(page: &JitPage, buf_pre_ptr: *mut u8) -> usize {
     let mut off = 0usize;
-
-    // ── Step 1: Load buf_pre base address into X28. ──
-    // We need X28 as our scratch pointer. First, we'll save the caller's X28
-    // and X29 to the stack, then load our pointer.
-    //
-    // But we can't STP to buf_pre yet because we don't have the pointer!
-    // Solution: load the pointer into X28 first (clobbering it), then
-    // immediately save the *original* X28 from... we don't have it anymore.
-    //
-    // Revised approach: Use X0 as a temporary to save X28, then load the
-    // pointer. The prelude will capture X0's *seed* value (not original),
-    // which is fine because we don't care about the caller's X0.
-    //
-    // Actually, the cleanest approach:
-    // 1. STP X28, X30, [SP, #-16]!   — push caller's X28 and LR to stack
-    // 2. Load buf_pre into X28
-    // 3. Dump X0-X27 to buf_pre (X28 is our pointer, not being saved yet)
-    // 4. LDP X9, X10, [SP]           — recover original X28 into X9
-    // 5. STR X9, [X28, #gprs+28*8]   — store original X28 into buf_pre
-    // 6. STR X10, [X28, #gprs+30*8]  — store original X30 into buf_pre
-    // 7. STR X29, [X28, #gprs+29*8]  — store X29 (FP)
-    // 8. Load seed values into X0-X27
-
+    
     // Step 1: Push X28, X30 to stack (pre-indexed: SP -= 16, then store).
     //   STP X28, X30, [SP, #-16]!
     //   Encoding: pre-index STP = 10 101 0 011 0 <imm7> <Rt2> <Rn=SP(31)> <Rt>
