@@ -1,19 +1,6 @@
 # OPCODE — Bare-Metal Apple M4 SME Exploration
 
-A Rust JIT harness for reverse-engineering and executing matrix coprocessor instructions on Apple Silicon. Originally targeting Apple's undocumented AMX, the project discovered that **M4 uses ARM standard SME (Scalable Matrix Extension)** — not the proprietary AMX coprocessor — and built a JIT SGEMM kernel that **beats Accelerate.framework by 2.5×** at small tile sizes.
-
-## Key Discovery: M4 Uses ARM SME, Not Apple AMX
-
-Apple M4 on macOS Sequoia uses the **ARM standard SME instruction set** for matrix math. The proprietary AMX coprocessor (documented by corsix/amx and Dougall Johnson for M1/M2/M3) is functionally dead on M4.
-
-**Evidence:**
-
-| Method | Result |
-|:-------|:-------|
-| Frida Stalker trace of `APL_sgemm` (50K+ insns) | **Zero** AMX opcodes in the execution stream |
-| Synthetic AMX instructions (LDX/LDY/FMA/STZ) | Execute without fault but produce **all-zeros** |
-| AMX operand bit-walk (100+ variations) | All zeros |
-| ARM SME `FMOPA` outer product | **Correct result on first attempt** |
+A Rust JIT harness for reverse-engineering and executing matrix coprocessor instructions on Apple Silicon that **beats Accelerate.framework by 2.5×** at small tile sizes.
 
 **M4 SME parameters:**
 - SVL (Scalable Vector Length) = **512 bits**
