@@ -513,6 +513,57 @@ pub const AMX_SET: u32 = 0x0020_1000;
 /// Encoding: `0x0020_1001` (corsix/amx community reverse-engineering).
 pub const AMX_CLR: u32 = 0x0020_1001;
 
+// --- Apple AMX Instruction Encoding ---
+
+/// Encode an Apple AMX instruction with a single register operand (Xn).
+///
+/// Encoding: `0x0020_1000 | (op_class << 5) | Xn`
+///
+/// This "simple" model is used for control (SET/CLR) and basic operations.
+/// Many AMX ops (FMA, LDX, LDY) use packed 64-bit values in Xn to encode
+/// complex operands (tile indices, memory addresses, etc.).
+pub const fn encode_amx_simple(op_class: u8, xn: u8) -> u32 {
+    assert!(op_class <= 0x1F, "AMX op_class must be 0–31");
+    assert!(xn <= 31, "AMX register index must be 0–31");
+    0x0020_1000 | ((op_class as u32) << 5) | (xn as u32)
+}
+
+/// AMX_LDX: Load A-matrix rows into AMX X registers.
+/// `op_class = 0x00`
+pub const fn encode_amx_ldx(xn: u8) -> u32 { encode_amx_simple(0x00, xn) }
+
+/// AMX_LDY: Load B-matrix rows into AMX Y registers.
+/// `op_class = 0x01`
+pub const fn encode_amx_ldy(xn: u8) -> u32 { encode_amx_simple(0x01, xn) }
+
+/// AMX_STX: Store X register to memory.
+/// `op_class = 0x02`
+pub const fn encode_amx_stx(xn: u8) -> u32 { encode_amx_simple(0x02, xn) }
+
+/// AMX_STY: Store Y register to memory.
+/// `op_class = 0x03`
+pub const fn encode_amx_sty(xn: u8) -> u32 { encode_amx_simple(0x03, xn) }
+
+/// AMX_LDZ: Load Z tile from memory.
+/// `op_class = 0x04`
+pub const fn encode_amx_ldz(xn: u8) -> u32 { encode_amx_simple(0x04, xn) }
+
+/// AMX_STZ: Store Z tile to memory.
+/// `op_class = 0x05`
+pub const fn encode_amx_stz(xn: u8) -> u32 { encode_amx_simple(0x05, xn) }
+
+/// AMX_EXTRX: Extract from Z to X register.
+/// `op_class = 0x08`
+pub const fn encode_amx_extrx(xn: u8) -> u32 { encode_amx_simple(0x08, xn) }
+
+/// AMX_EXTRY: Extract from Z to Y register.
+/// `op_class = 0x09`
+pub const fn encode_amx_extry(xn: u8) -> u32 { encode_amx_simple(0x09, xn) }
+
+/// AMX_FMA32: 32-bit float multiply-accumulate.
+/// `op_class = 0x0C`
+pub const fn encode_amx_fma32(xn: u8) -> u32 { encode_amx_simple(0x0C, xn) }
+
 // --- PC-relative hazard patching ---
 
 /// AArch64 NOP instruction.
@@ -640,6 +691,159 @@ pub fn relocate_branches(
     }
 
     patched
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SME SGEMM Kernel Builder
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// SVE LD1W (scalar+scalar): `LD1W {Zt.S}, Pg/Z, [Xn, Xm, LSL #2]`
+///
+/// Encoding: `1010_0101_01_0_Rm[4:0]_010_Pg[2:0]_Rn[4:0]_Zt[4:0]`
+pub const fn encode_sve_ld1w_ss(zt: u8, pg: u8, rn: u8, rm: u8) -> u32 {
+    0xA540_4000
+        | ((rm as u32) << 16)
+        | ((pg as u32) << 10)
+        | ((rn as u32) <<  5)
+        | (zt as u32)
+}
+
+/// `ADD Xd, Xn, #imm12` — 64-bit immediate add, no shift.
+pub const fn encode_add_x_imm(rd: u8, rn: u8, imm12: u16) -> u32 {
+    0x9100_0000 | ((imm12 as u32) << 10) | ((rn as u32) << 5) | (rd as u32)
+}
+
+/// `ADD Wd, Wn, #imm12` — 32-bit immediate add, no shift.
+pub const fn encode_add_w_imm(rd: u8, rn: u8, imm12: u16) -> u32 {
+    0x1100_0000 | ((imm12 as u32) << 10) | ((rn as u32) << 5) | (rd as u32)
+}
+
+/// `MOVZ Xd, #imm16, LSL #shift` — load 16-bit immediate into 64-bit register.
+pub const fn encode_movz_x64(rd: u8, imm16: u16, shift: u8) -> u32 {
+    let hw = (shift / 16) as u32;
+    0xD280_0000 | (hw << 21) | ((imm16 as u32) << 5) | (rd as u32)
+}
+
+/// `MOVK Xd, #imm16, LSL #shift` — insert 16-bit immediate, keeping other bits.
+pub const fn encode_movk_x64(rd: u8, imm16: u16, shift: u8) -> u32 {
+    let hw = (shift / 16) as u32;
+    0xF280_0000 | (hw << 21) | ((imm16 as u32) << 5) | (rd as u32)
+}
+
+/// `MOV Xd, XZR` — zero a register (alias: `ORR Xd, XZR, XZR`).
+pub const fn encode_mov_xzr(rd: u8) -> u32 {
+    // MOVZ Xd, #0
+    0xD280_0000 | (rd as u32)
+}
+
+/// Emit a MOVZ/MOVK sequence to load a full 64-bit immediate into `rd`.
+/// Returns the instructions as a Vec.
+pub fn emit_load_imm64_vec(rd: u8, value: u64) -> Vec<u32> {
+    let mut insns = Vec::with_capacity(4);
+    let mut first = true;
+    for i in 0..4u8 {
+        let shift = i * 16;
+        let chunk = ((value >> shift) & 0xFFFF) as u16;
+        if chunk == 0 && !first { continue; }
+        if first {
+            insns.push(encode_movz_x64(rd, chunk, shift));
+            first = false;
+        } else {
+            insns.push(encode_movk_x64(rd, chunk, shift));
+        }
+    }
+    insns
+}
+
+/// Build a complete SME SGEMM kernel for M=N=16 (one ZA0 tile), K iterations.
+///
+/// M4 SVL = 512 bits → 16 float32 per Z register → ZA0 is a 16×16 tile.
+///
+/// Register ABI (set via overrides before SMSTART):
+/// - `X2`  = C output pointer (row-major 16×16)
+/// - `X3`  = 0 (zero offset for LD1W / ST1W)
+/// - `X4`  = A pointer (K vectors of 16 floats, contiguous)
+/// - `X5`  = B pointer (K vectors of 16 floats, contiguous)
+/// - `X12` = W12 = 0 (ST1W slice index)
+///
+/// The returned opcodes run inside streaming mode (caller provides SMSTART/SMSTOP).
+pub fn build_sme_sgemm_16x16(k: usize) -> Vec<u32> {
+    const PTRUE_P0_S: u32 = 0x2598_E3E0;
+    const SVL_BYTES: u16 = 64;
+    const TILE_ROWS: usize = 16;
+
+    let ld1w_z0_x4 = encode_sve_ld1w_ss(0, 0, 4, 3);
+    let ld1w_z1_x5 = encode_sve_ld1w_ss(1, 0, 5, 3);
+    let fmopa_za0  = 0x8081_0000_u32; // FMOPA ZA0.S, P0/M, Z0.S, Z1.S
+    let add_x4_svl = encode_add_x_imm(4, 4, SVL_BYTES);
+    let add_x5_svl = encode_add_x_imm(5, 5, SVL_BYTES);
+    let st1w_za0   = encode_sme_st1w_za_h(0, 0, 0, 2, 3);
+    let add_w12_1  = encode_add_w_imm(12, 12, 1);
+    let add_x2_svl = encode_add_x_imm(2, 2, SVL_BYTES);
+
+    let mut block = Vec::with_capacity(2 + 5 * k + 3 * TILE_ROWS);
+    block.push(PTRUE_P0_S);
+    block.push(ZERO_ZA);
+
+    for _ in 0..k {
+        block.push(ld1w_z0_x4);
+        block.push(ld1w_z1_x5);
+        block.push(fmopa_za0);
+        block.push(add_x4_svl);
+        block.push(add_x5_svl);
+    }
+
+    for _ in 0..TILE_ROWS {
+        block.push(st1w_za0);
+        block.push(add_w12_1);
+        block.push(add_x2_svl);
+    }
+
+    block
+}
+
+/// Build a self-contained JIT page for the SME SGEMM kernel.
+///
+/// The page includes pointer-loading preamble (MOVZ/MOVK), SMSTART,
+/// the kernel, SMSTOP, and RET — callable via `page.call_void()` with
+/// no external setup.
+pub fn build_sme_sgemm_page(
+    k: usize,
+    a_ptr: u64,
+    b_ptr: u64,
+    c_ptr: u64,
+) -> Option<crate::jit_page::JitPage> {
+    const RET: u32 = 0xD65F_03C0;
+
+    let kernel = build_sme_sgemm_16x16(k);
+
+    // Preamble: load pointers into X2(C), X3(0), X4(A), X5(B), X12(0)
+    let mut insns = Vec::with_capacity(20 + kernel.len() + 3);
+    insns.extend(emit_load_imm64_vec(2, c_ptr));   // X2 = C
+    insns.push(encode_mov_xzr(3));                   // X3 = 0
+    insns.extend(emit_load_imm64_vec(4, a_ptr));    // X4 = A
+    insns.extend(emit_load_imm64_vec(5, b_ptr));    // X5 = B
+    insns.push(encode_mov_xzr(12));                  // X12 = 0
+
+    insns.push(SMSTART);                              // enter streaming mode
+    insns.extend_from_slice(&kernel);                 // SGEMM kernel
+    insns.push(SMSTOP);                               // exit streaming mode
+    insns.push(RET);
+
+    let total_bytes = insns.len() * 4;
+    let page_size = ((total_bytes + 16383) / 16384) * 16384;
+
+    let page = crate::jit_page::JitPage::alloc(page_size).ok()?;
+    page.make_writable();
+
+    let mut off = 0;
+    for &op in &insns {
+        page.write_instruction(off, op);
+        off += 4;
+    }
+
+    page.make_executable();
+    Some(page)
 }
 
 #[cfg(test)]

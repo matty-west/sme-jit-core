@@ -24,7 +24,12 @@ function isUnconditionalRet(op) {
 function isStoreOp(op) {
     const isAmx = (op & 0xFFF00000) === 0x00200000;
     const isSme = (op & 0xF0000000) === 0xE0000000;
-    return isAmx || isSme;
+    if (isAmx) {
+        const op_class = (op >>> 5) & 0x1F;
+        // op_class 0x02=STX, 0x03=STY, 0x05=STZ, 0x07=STZI
+        return op_class === 0x02 || op_class === 0x03 || op_class === 0x05 || op_class === 0x07;
+    }
+    return isSme;
 }
 
 function storeType(op) {
@@ -114,6 +119,7 @@ function initializeHeist() {
                             insideSgemm++;
                             callDepth = 0;
                             console.log('[*] cblas_sgemm called (insideSgemm=' + insideSgemm + ')');
+                            console.log('[*] cblas_sgemm ABI: x0=' + this.context.x0 + ' x1=' + this.context.x1 + ' x2=' + this.context.x2);
                         },
                         onLeave: function(retval) {
                             insideSgemm = Math.max(0, insideSgemm - 1);
@@ -134,11 +140,13 @@ function initializeHeist() {
                 }
             }
 
-            if (m.name.indexOf('BLAS') !== -1) {
+            if (exp.name.toLowerCase().includes('sgemm')) {
                 try {
                     Interceptor.attach(exp.address, {
                         onEnter: function(args) {
-                            if (insideSgemm === 0) return;
+                            // Don't filter by insideSgemm for APL_sgemm itself if we want to be sure
+                            const isMicro = exp.name === 'APL_sgemm';
+                            if (insideSgemm === 0 && !isMicro) return;
 
                             const indent = '  '.repeat(callDepth);
                             console.log(indent + '-> ' + exp.name + ' @ ' + exp.address);
@@ -146,6 +154,13 @@ function initializeHeist() {
                             this.capturedDepth = callDepth;
 
                             const abi = captureAbi(this.context);
+                            
+                            if (isMicro) {
+                                console.log(indent + '  [OPERANDS] x0=' + abi.x0 + ' x1=' + abi.x1 + ' x2=' + abi.x2);
+                                console.log(indent + '  [OPERANDS] x5=' + abi.x5 + ' x7=' + abi.x7 + ' x8=' + abi.x8);
+                                console.log(indent + '  [OPERANDS] x9=' + abi.x9 + ' x10=' + abi.x10 + ' x17=' + abi.x17);
+                            }
+
                             const extracted = extractFunction(exp.address, 50000, 3);
                             extracted.block.forEach(function(h) { opcodes.add(h); });
 
@@ -168,7 +183,6 @@ function initializeHeist() {
                         },
 
                         onLeave: function(retval) {
-                            if (insideSgemm === 0) return;
                             if (this.capturedDepth !== undefined) {
                                 callDepth = this.capturedDepth - 1;
                             }
@@ -201,6 +215,7 @@ def on_message(message, data):
                 json.dump(payload['blocks'], f, indent=2)
             print("[*] Written: stolen_blocks.json")
 
+            time.sleep(1) # Give console.log some time to flush
             sys.exit(0)
     elif message['type'] == 'error':
         print(f"[!] JS error: {message['description']}")

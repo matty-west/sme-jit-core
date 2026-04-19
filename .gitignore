@@ -1,9 +1,30 @@
+# Build artifacts
 /target
-/planning
-/.github
-/output
-.DS_Store
 Cargo.lock
+
+# macOS
+.DS_Store
+
+# Python
 .venv
+__pycache__/
+*.pyc
+
+# Frida heist outputs (contain extracted proprietary code)
 *.json
 heist/amx_runner
+
+# Debug / scratch logs
+heist_debug.txt
+heist_output.txt
+*.log
+/output
+
+# AI guidance (project-internal, not for public repo)
+/.github
+/planning
+
+# IDE
+.idea/
+*.swp
+*~

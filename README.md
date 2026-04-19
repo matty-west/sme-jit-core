@@ -1,12 +1,105 @@
-# jit_explore
+# OPCODE — Bare-Metal Apple M4 SME Exploration
 
-A project for exploring Apple's AMX (Apple Matrix) instructions through JIT and targeted exploration.
+A Rust JIT harness for reverse-engineering and executing matrix coprocessor instructions on Apple Silicon. Originally targeting Apple's undocumented AMX, the project discovered that **M4 uses ARM standard SME (Scalable Matrix Extension)** — not the proprietary AMX coprocessor — and built a JIT SGEMM kernel that **beats Accelerate.framework by 2.5×** at small tile sizes.
 
-The core of this project uses a "heist" strategy to extract and verify AMX opcodes by running them in a controlled environment.
+## Key Discovery: M4 Uses ARM SME, Not Apple AMX
 
-## Structure
+Apple M4 on macOS Sequoia uses the **ARM standard SME instruction set** for matrix math. The proprietary AMX coprocessor (documented by corsix/amx and Dougall Johnson for M1/M2/M3) is functionally dead on M4.
 
-- `src/`: Rust core for JIT emission and state management.
-- `heist/`: Scripts and runners for extracting AMX instruction data.
-- `planning/`: Documentation on research and strategy.
-- `output/`: (Ignored) Generated instruction data and binaries.
+**Evidence:**
+
+| Method | Result |
+|:-------|:-------|
+| Frida Stalker trace of `APL_sgemm` (50K+ insns) | **Zero** AMX opcodes in the execution stream |
+| Synthetic AMX instructions (LDX/LDY/FMA/STZ) | Execute without fault but produce **all-zeros** |
+| AMX operand bit-walk (100+ variations) | All zeros |
+| ARM SME `FMOPA` outer product | **Correct result on first attempt** |
+
+**M4 SME parameters:**
+- SVL (Scalable Vector Length) = **512 bits**
+- 16 float32 per Z register
+- ZA tile = 16×16 = 256 float32 values
+- One `FMOPA` computes **256 multiply-accumulates** per instruction
+
+## Benchmark Results
+
+JIT-emitted SME SGEMM kernel vs `cblas_sgemm` (Accelerate.framework), 16×16 tile:
+
+```
+                    Accelerate    JIT (bare-metal)    Speedup
+K=4  (1K MACs)       117.8 ns        65.0 ns          1.81×
+K=16 (4K MACs)       164.5 ns        66.0 ns          2.49×
+K=64 (16K MACs)      236.5 ns       101.5 ns          2.33×
+```
+
+The JIT kernel wins because it has **zero dispatch overhead** — no argument validation, no size routing, no thread pool setup. At small tile sizes, Accelerate's dispatch logic dominates its runtime.
+
+## What This Does
+
+1. **Probes** — Executes arbitrary AArch64 opcodes in a fault-tolerant JIT sandbox (fork + SIGILL/SEGV/SIGBUS recovery)
+2. **Heists** — Extracts machine code from `Accelerate.framework` via Frida, capturing Apple's proprietary microkernels
+3. **Discovers** — Proved M4 uses ARM SME through Frida Stalker tracing + empirical instruction probing
+4. **Computes** — JIT-emits SME instruction sequences (LD1W → FMOPA → ST1W) producing correct SGEMM results
+5. **Verifies** — Differential correctness via Crucible: `max_diff = 0.0` vs `cblas_sgemm`
+6. **Benchmarks** — Criterion benchmarks comparing JIT throughput against Accelerate
+
+## Milestones
+
+| Gate | Goal | Status |
+|:-----|:-----|:-------|
+| 0–9 | JIT page allocation, fault recovery, fork probing, GPR snapshots | ✅ |
+| 10–12 | Frida heist of APL_sgemm, leaf isolation, instruction classification | ✅ |
+| 13 | Execute 651-instruction AMX FMA leaf fault-free | ✅ |
+| 14a–b | Synthetic AMX tests + operand bit-walk (all zeros — dead end) | ✅ |
+| 14c | **SME pivot: FMOPA produces first non-zero result** | ✅ |
+| 14d | **Full 16×16×K SGEMM, max_diff = 0.0 vs Accelerate** | ✅ |
+| 15 | **Benchmark: JIT beats Accelerate 1.8–2.5×** | ✅ |
+| 16 | Multi-tile tiling (M,N > 16) | ⬜ |
+| 17 | OS scheduler bypass (P-core pinning, mlock) | ⬜ |
+
+## Project Structure
+
+```
+src/
+  main.rs              Gate functions (progressive capability tests)
+  emitter.rs           AArch64/SME instruction encoding + SGEMM kernel builder
+  probe.rs             Fork-based opcode probing and block execution
+  crucible.rs          Differential correctness testing (Accelerate vs JIT)
+  jit_page.rs          MAP_JIT page allocation with W^X toggle
+  cpu_state.rs         GPR snapshot capture before/after execution
+  signal_handler.rs    Fault recovery (SIGILL/SEGV/SIGBUS/SIGALRM)
+  leaf.rs              RET-boundary leaf extraction from stolen blocks
+  sink.rs              JSONL result logging with resume support
+
+benches/
+  crucible_bench.rs    Criterion benchmarks (accelerate vs jit_cold vs jit_hot)
+
+heist/
+  extract_all.py       Frida script to extract APL_sgemm from Accelerate.framework
+  amx_encoding_audit.py  Decoder for AMX opcode classification
+  capture_operands.py  Frida Stalker trace capture
+  list_exports.py      Enumerate Accelerate symbol table
+```
+
+## Quick Start
+
+```sh
+# Run the current gate (16×16 SGEMM correctness test)
+cargo run --release
+
+# Run benchmarks (Accelerate vs JIT)
+cargo bench
+
+# Just the bare-metal JIT benchmark
+cargo bench -- jit_hot
+
+# Just the Accelerate baseline
+cargo bench -- accelerate
+```
+
+## Requirements
+
+- Apple Silicon Mac (M4 tested; M1–M3 will use AMX path which is currently non-functional)
+- macOS Sequoia 15+
+- Rust nightly
+- Python 3 with Frida (`pip install frida frida-tools`) for heist scripts

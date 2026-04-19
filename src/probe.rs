@@ -58,12 +58,12 @@ mod accelerate {
     }
 }
 
-struct SharedMemory<T> {
+pub struct SharedMemory<T> {
     ptr: *mut T,
 }
 
 impl<T> SharedMemory<T> {
-    fn new() -> Self {
+    pub fn new() -> Self {
         let size = std::mem::size_of::<T>();
         let ptr = unsafe {
             libc::mmap(
@@ -79,8 +79,8 @@ impl<T> SharedMemory<T> {
         unsafe { std::ptr::write_bytes(ptr, 0, size); }
         Self { ptr: ptr as *mut T }
     }
-    fn as_mut_ptr(&self) -> *mut T { self.ptr }
-    fn get(&self) -> &T { unsafe { &*self.ptr } }
+    pub fn as_mut_ptr(&self) -> *mut T { self.ptr }
+    pub fn get(&self) -> &T { unsafe { &*self.ptr } }
 }
 
 impl<T> Drop for SharedMemory<T> {

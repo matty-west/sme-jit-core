@@ -97,6 +97,10 @@ pub struct LeafKernel {
     pub opcodes:          Vec<u32>,
     /// Number of Apple AMX instructions detected (`0x0020_xxxx` prefix).
     pub amx_count:        usize,
+    /// Number of AMX store instructions in this leaf.
+    pub amx_store_count:  usize,
+    /// Number of AMX FMA instructions in this leaf.
+    pub amx_fma_count:    usize,
     /// Indices into `opcodes` where `ADRP` instructions live.  These compute
     /// page-relative addresses and will produce wrong values after relocation.
     pub adrp_indices:     Vec<usize>,
@@ -122,20 +126,24 @@ impl LeafKernel {
     ///
     /// Rewards AMX density; penalises PC-relative hazards.
     pub fn score(&self) -> i64 {
-        let amx      = self.amx_count as i64;
-        let hazards  = (self.adrp_indices.len() + self.adr_indices.len()) as i64;
-        amx * 10 - hazards * 50
+        let fma     = self.amx_fma_count as i64;
+        let stores  = self.amx_store_count as i64;
+        let hazards = (self.adrp_indices.len() + self.adr_indices.len()) as i64;
+        // FMA-heavy leaves score highest; store-containing leaves also valuable
+        fma * 10 + stores * 5 - hazards * 50
     }
 
     /// Pretty-print a one-line summary suitable for gate output.
     pub fn summary(&self) -> String {
         format!(
-            "{} +0x{:06x}: {} insns  ({} AMX, {} branches)  \
+            "{} +0x{:06x}: {} insns  ({} AMX: {} FMA, {} ST, {} branches)  \
              literal_pool={}  ADRP/ADR hazards={}  score={}",
             self.source_name,
             self.leaf_byte_offset,
             self.opcodes.len(),
             self.amx_count,
+            self.amx_fma_count,
+            self.amx_store_count,
             self.opcodes.iter().filter(|&&op| decode_branch(op).is_some()).count(),
             self.literal_pool_len,
             self.adrp_indices.len() + self.adr_indices.len(),
@@ -193,6 +201,35 @@ fn sign_extend14(raw: u32) -> i32 {
 
 pub(crate) fn is_ret(op: u32)  -> bool { (op & 0xFFFF_FC1F) == 0xD65F_0000 }
 pub(crate) fn is_amx(op: u32)  -> bool { (op & 0xFFF0_0000) == 0x0020_0000 }
+
+/// Returns true if the opcode is a genuine AMX store instruction.
+///
+/// Uses the corsix/amx bit-field decode: `op_class = (op >> 5) & 0x1F`
+///
+/// Store op_classes:
+/// - `0x02` = AMX_STX  — store X register to memory
+/// - `0x03` = AMX_STY  — store Y register to memory  
+/// - `0x05` = AMX_STZ  — store Z accumulator tile to memory ← C-matrix output
+/// - `0x07` = AMX_STZI — store Z interleaved to memory
+///
+/// The previous heist-set lookup (`stores[]` from Frida) was incorrect: it
+/// classified ALL `0x0020_xxxx` AMX instructions (FMA, LDX, LDY, SET, CLR)
+/// as "stores".  This version uses the authoritative op_class field directly.
+/// See `heist/amx_encoding_audit.py` for the full 115-opcode breakdown.
+pub(crate) fn is_amx_store(op: u32) -> bool {
+    if !is_amx(op) { return false; }
+    let op_class = (op >> 5) & 0x1F;
+    matches!(op_class, 0x02 | 0x03 | 0x05 | 0x07)
+}
+
+/// Returns true if the opcode looks like an AMX FMA (multiply-accumulate).
+pub(crate) fn is_amx_fma(op: u32) -> bool {
+    if !is_amx(op) { return false; }
+    let op_class = (op >> 5) & 0x1F;
+    // op_class 0x0A=FMA64, 0x0C=FMA32, 0x0E=MAC16, 0x0F=FMA16
+    matches!(op_class, 0x0A | 0x0C | 0x0E | 0x0F)
+}
+
 pub(crate) fn is_adrp(op: u32) -> bool { (op >> 24) & 0x9F   == 0x90 }
 pub(crate) fn is_adr(op: u32)  -> bool { (op >> 24) & 0x9F   == 0x10 }
 
@@ -287,6 +324,13 @@ pub fn find_leaves(
             continue;
         }
 
+        let amx_store_count = region.iter()
+            .filter(|&&op| is_amx_store(op))
+            .count();
+        let amx_fma_count = region.iter()
+            .filter(|&&op| is_amx_fma(op))
+            .count();
+
         let adrp_indices: Vec<usize> = region.iter().enumerate()
             .filter(|&(_, op)| is_adrp(*op))
             .map(|(i, _)| i)
@@ -307,6 +351,8 @@ pub fn find_leaves(
             leaf_byte_offset: (start * 4) as u64,
             opcodes:          region.to_vec(),
             amx_count,
+            amx_store_count,
+            amx_fma_count,
             adrp_indices,
             adr_indices,
             literal_pool_len,
@@ -414,4 +460,43 @@ pub fn all_leaves_from_file(path: &Path) -> Vec<LeafKernel> {
         return find_leaves(&b.name, base_of(b), &opcodes, &stores);
     }
     Vec::new()
+}
+
+/// Find the store-back sub-function nearest to a compute leaf.
+///
+/// Strategy:
+/// 1. Look at the sub-function immediately AFTER the compute leaf in the
+///    original APL_sgemm layout (same RET-boundary list).
+/// 2. If it has `amx_store_count > 0`, return it.
+/// 3. If not, scan the next 3 sub-functions forward.
+/// 4. As a fallback, scan backward too.
+///
+/// Returns `None` if no store-containing sub-function is found nearby.
+pub fn find_store_leaf_near(
+    all_leaves: &[LeafKernel],     // from find_leaves(), sorted by score
+    compute_offset: u64,            // byte offset of the compute leaf
+) -> Option<LeafKernel> {
+    // Sort by byte offset for adjacency search
+    let mut by_offset: Vec<&LeafKernel> = all_leaves.iter().collect();
+    by_offset.sort_by_key(|l| l.leaf_byte_offset);
+
+    // Find the compute leaf's position
+    let compute_idx = by_offset.iter()
+        .position(|l| l.leaf_byte_offset == compute_offset)?;
+
+    // Search forward first (store usually follows compute)
+    for i in (compute_idx + 1)..by_offset.len().min(compute_idx + 5) {
+        if by_offset[i].amx_store_count > 0 {
+            return Some((*by_offset[i]).clone());
+        }
+    }
+
+    // Search backward
+    for i in (compute_idx.saturating_sub(3)..compute_idx).rev() {
+        if by_offset[i].amx_store_count > 0 {
+            return Some((*by_offset[i]).clone());
+        }
+    }
+
+    None
 }

@@ -4,32 +4,26 @@
 #include <unistd.h>
 
 int main() {
-    printf("amx_runner: Runner booted. PID: %d\n", getpid());
-    printf("amx_runner: Press ENTER to execute cblas_sgemm...\n");
-    getchar(); // Blocks here. dyld is completely finished.
+    printf("[*] AMX runner active. Sleeping 1s...\n");
+    sleep(1);
 
-    const int N = 64;
-    float *A = (float *)malloc(N * N * sizeof(float));
-    float *B = (float *)malloc(N * N * sizeof(float));
-    float *C = (float *)malloc(N * N * sizeof(float));
+    int n = 512;
+    printf("[*] Allocating matrices for n=%d...\n", n);
+    float *a = malloc(n * n * sizeof(float));
+    float *b = malloc(n * n * sizeof(float));
+    float *c = malloc(n * n * sizeof(float));
 
-    for (int i = 0; i < N * N; i++) {
-        A[i] = (float)rand() / (float)RAND_MAX;
-        B[i] = (float)rand() / (float)RAND_MAX;
-        C[i] = 0.0f;
+    for (int i = 0; i < n * n; i++) {
+        a[i] = 1.0f;
+        b[i] = 1.0f;
     }
 
-    printf("amx_runner: executing cblas_sgemm...\n");
-    // Matrix multiplication: C = 1.0 * A * B + 0.0 * C
-    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                N, N, N, 1.0, A, N, B, N, 0.0, C, N);
+    printf("[*] Running sgemm(%d, %d, %d)...\n", n, n, n);
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, n, n, n, 1.0f, a, n, b, n, 0.0f, c, n);
+    printf("[*] Done. c[0] = %f\n", c[0]);
 
-    printf("amx_runner: check C[0] = %f\n", C[0]);
-    
-    free(A);
-    free(B);
-    free(C);
-    
-    printf("amx_runner: done\n");
+    free(a);
+    free(b);
+    free(c);
     return 0;
 }
