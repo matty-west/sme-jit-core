@@ -1,16 +1,18 @@
 [package]
-name = "jit_explore"
+name = "sme-jit-core"
 version = "0.1.0"
 edition = "2024"
+description = "Zero-overhead Rust JIT harness for ARM SME on Apple Silicon M4"
+repository = "https://github.com/dawnstate/sme-jit-core"
 
 # ── Library crate (re-exports harness modules for benchmarks / integration tests)
 [lib]
-name = "jit_explore"
+name = "sme_jit_core"
 path = "src/lib.rs"
 
 # ── Binary crate (gate runner)
 [[bin]]
-name = "jit_explore"
+name = "sme-jit-core"
 path = "src/main.rs"
 
 # ── Runtime dependencies
@@ -27,7 +29,3 @@ criterion = { version = "0.5", features = ["html_reports"] }
 [[bench]]
 name    = "crucible_bench"
 harness = false
-
-# ── macOS-only framework link
-[target.'cfg(target_os = "macos")'.dependencies]
-accelerate-src = "0.3.2"

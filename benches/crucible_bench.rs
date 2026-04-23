@@ -19,8 +19,8 @@
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 
-use jit_explore::emitter::{build_sme_sgemm_16x16, build_sme_sgemm_page};
-use jit_explore::probe::{Probe, SharedMemory};
+use sme_jit_core::emitter::{build_sme_sgemm_16x16, build_sme_sgemm_page};
+use sme_jit_core::probe::{Probe, SharedMemory};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -36,10 +36,10 @@ fn wake_hardware() {
     let mut c = [0.0f32; 16];
     // SAFETY: valid pointers, sizes correct, Accelerate always present.
     unsafe {
-        jit_explore::crucible::cblas_sgemm(
-            jit_explore::crucible::CblasOrder::RowMajor,
-            jit_explore::crucible::CblasTranspose::NoTrans,
-            jit_explore::crucible::CblasTranspose::NoTrans,
+        sme_jit_core::crucible::cblas_sgemm(
+            sme_jit_core::crucible::CblasOrder::RowMajor,
+            sme_jit_core::crucible::CblasTranspose::NoTrans,
+            sme_jit_core::crucible::CblasTranspose::NoTrans,
             4, 4, 4,
             1.0, a.as_ptr(), 4, b.as_ptr(), 4, 0.0, c.as_mut_ptr(), 4,
         );
@@ -68,10 +68,10 @@ fn bench_accelerate(c: &mut Criterion) {
             b_iter.iter(|| {
                 // SAFETY: valid pointers, correct sizes.
                 unsafe {
-                    jit_explore::crucible::cblas_sgemm(
-                        jit_explore::crucible::CblasOrder::RowMajor,
-                        jit_explore::crucible::CblasTranspose::NoTrans,
-                        jit_explore::crucible::CblasTranspose::NoTrans,
+                    sme_jit_core::crucible::cblas_sgemm(
+                        sme_jit_core::crucible::CblasOrder::RowMajor,
+                        sme_jit_core::crucible::CblasTranspose::NoTrans,
+                        sme_jit_core::crucible::CblasTranspose::NoTrans,
                         m as i32, n as i32, k as i32,
                         1.0,
                         a.as_ptr(), k as i32,

@@ -1,4 +1,4 @@
-//! `jit_explore` — library crate entry point.
+//! `sme-jit-core` — bare-metal ARM SME JIT harness for Apple Silicon M4.
 //!
 //! Re-exports the harness modules so that `benches/` and integration tests
 //! can import them without duplicating the `main.rs` binary.
