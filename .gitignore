@@ -20,9 +20,10 @@ heist_output.txt
 *.log
 /output
 
-# AI guidance (project-internal, not for public repo)
+# Documentation
 /.github
 /planning
+/ARCHITECTURE.md
 
 # IDE
 .idea/

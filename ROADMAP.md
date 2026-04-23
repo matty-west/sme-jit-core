@@ -1,4 +1,4 @@
-# OPCODE Roadmap
+# sme-jit-core Roadmap
 
 ## Where We Are
 
@@ -9,57 +9,78 @@ Gates 0–15 are complete. We have:
 - Differential correctness: `max_diff = 0.0` vs Accelerate
 - Benchmark: 1.8–2.5× faster than Accelerate at tile-sized problems
 
-## Gate 16: Multi-Tile Tiling (M,N > 16)
+## Gate 16: BFMOPA / SMOPA Probing
 
-**Goal**: Handle matrices larger than one ZA tile (16×16).
+**Goal**: Discover which extended outer product instructions M4 supports.
 
-The current kernel computes exactly one 16×16 output tile. For larger M×N, we need
-an outer loop that walks tiles across the output matrix:
+ARM SME defines several outer product variants beyond FMOPA (FP32):
 
-```
-for tile_m in (0..M).step_by(16):
-  for tile_n in (0..N).step_by(16):
-    ZERO {ZA}
-    for kk in 0..K:
-      LD1W Z0, [A + tile_m*K + kk*16]
-      LD1W Z1, [B + kk*N + tile_n]
-      FMOPA ZA0.S, P0/M, Z0.S, Z1.S
-    ST1W ZA0H[0..15] → C[tile_m..tile_m+16, tile_n..tile_n+16]
-```
+| Instruction | Operands | MACs/inst | Potential speedup |
+|:------------|:---------|:----------|:------------------|
+| **BFMOPA** | BF16 → FP32 | 512 | 2× over FMOPA |
+| **BFMOPS** | BF16 → FP32 (subtract) | 512 | — |
+| **SMOPA** | INT8 → INT32 | 1024 | 4× over FMOPA |
+| **UMOPA** | UINT8 → INT32 | 1024 | 4× over FMOPA |
+| **SUMOPA** | INT8×UINT8 → INT32 | 1024 | 4× mixed |
 
-**Key decisions**:
-- Emit the tile loop in JIT (unrolled or with branch-back)?
-- Pointer arithmetic: stride-aware addressing for row-major layout
-- Edge tiles: predicate masking when M%16 ≠ 0 or N%16 ≠ 0
+**Approach**:
+1. Encode each variant using known ARM encodings
+2. Probe via fork-based harness (fault → not supported, no fault → supported)
+3. For supported instructions, build correctness tests:
+   - Pack BF16 inputs, execute BFMOPA, verify against FP32 reference
+   - Pack INT8 inputs, execute SMOPA, verify against INT32 reference
+4. Benchmark supported variants against Accelerate
+5. Document M4 SME capability matrix (first public data)
 
-**Correctness target**: `max_diff < 1e-4` vs Accelerate for 64×64, 128×128, 256×256.
+**Key encodings to probe**:
+- BFMOPA ZA0.S, P0/M, Z0.H, Z1.H: `0x8181_0000`
+- SMOPA ZA0.S, P0/M, Z0.B, Z1.B: `0xA080_0000`
+- UMOPA ZA0.S, P0/M, Z0.B, Z1.B: `0xA180_0000`
 
-## Gate 17: OS Scheduler Bypass
+**Success criteria**: At least one new outer product instruction confirmed working, with correctness test and benchmark.
 
-**Goal**: Pin execution to P-cores and lock memory for deterministic benchmarks.
+## Gate 17: Fused GEMM + Activation Kernels
 
-- `pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE)` for P-core affinity
-- `mlock()` on JIT pages + input/output buffers
-- Measure variance reduction in Criterion benchmarks
+**Goal**: JIT-emit kernels that fuse matmul with activation functions in a single kernel — zero intermediate memory traffic.
 
-## Gate 18: Microarchitecture Optimization
+**Fusion targets** (in order of complexity):
 
-**Goal**: Extract more throughput from the M4 SME pipeline.
+1. **GEMM + ReLU**: After FMOPA accumulation, apply `FMAX Zn.S, Pn/M, Zn.S, #0.0` before ST1W. This is a single SVE instruction — trivial to add.
 
-Candidates:
-- **Double-buffered loads**: Interleave Z0/Z2 and Z1/Z3 loads with FMOPA to hide load latency
-- **FMOPA chaining**: Use multiple ZA tiles (ZA0–ZA3) if M4 supports concurrent accumulation
-- **BFMOPA**: BF16 outer product — 2× MACs per FMOPA if the hardware supports it
-- **SMOPA (I8)**: Integer 8-bit outer product for quantized inference
+2. **GEMM + Bias**: Load a bias vector into a Z register, add it to each output row before store. Requires one extra LD1W + FADD per row.
 
-## Gate 19: Larger Kernel Library
+3. **GEMM + GELU**: Approximate GELU via `x * sigmoid(1.702 * x)` using SVE FMUL/FADD/FRECPE. More instructions but still fused — no memory round-trip.
 
-**Goal**: Build out a suite of JIT-emitted kernels beyond SGEMM.
+4. **GEMM + Bias + ReLU**: Chain bias add and activation.
 
-- DGEMM (FP64 outer product via FMOPA.D)
-- SYRK / TRSM building blocks
-- Batched small-matrix multiply
-- Activation function fusion (ReLU/GELU after store)
+**Build plan**:
+1. Extend `build_sme_sgemm_16x16` to accept an `Activation` enum parameter
+2. Emit activation instructions between FMOPA loop and ST1W store loop
+3. Build correctness tests: compute reference in Rust (matmul + activation), compare against JIT output
+4. Benchmark fused kernel vs separate Accelerate SGEMM + vDSP activation calls
+
+**Stretch goal**: Chain 2-3 fused layers into a tiny MNIST inference engine. One binary, zero frameworks, classification in <1μs.
+
+## Gate 18: Tiny Inference Engine Demo
+
+**Goal**: Run a small neural network (2-3 layer MLP) entirely through JIT'd fused SME kernels.
+
+- Pre-train a tiny MNIST classifier in Python, export weights as raw f32 arrays
+- At startup, JIT-compile one fused kernel per layer (GEMM + bias + activation)
+- Chain kernel calls: input → layer1 → layer2 → output
+- Benchmark end-to-end latency vs CoreML / MLX / Accelerate
+- Measure the "framework tax" — how much overhead do ML frameworks add for tiny models?
+
+## Deferred (from original roadmap)
+
+These items are deprioritized but not abandoned:
+
+| Item | Original Gate | Status |
+|:-----|:-------------|:-------|
+| Multi-tile tiling (M,N > 16) | Gate 16 (old) | Deferred — focus on depth before breadth |
+| OS scheduler bypass (P-core pinning) | Gate 17 (old) | Deferred — nice for benchmarks, not critical path |
+| Double-buffered loads | Gate 18 (old) | Deferred — optimization after new instruction discovery |
+| Batched small-SGEMM | — | Deferred — build after fused kernels prove out |
 
 ## Non-Goals (Archived)
 
