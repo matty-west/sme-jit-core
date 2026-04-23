@@ -112,10 +112,10 @@ Modern ML infrastructure is built on layers of abstraction — frameworks dispat
 
 `sme-jit-core` strips away every layer and proves what the hardware can actually do when you let it. By reverse-engineering Apple's undocumented M4 matrix coprocessor and emitting instructions directly, we expose the true performance ceiling — and demonstrate that even Apple's own Accelerate framework doesn't reach it.
 
-This is the founding artifact of **[Dawn State](https://github.com/dawnstate)** — an independent research lab exploring the full AI compute stack from silicon to swarms. We believe that pushing the ML frontier requires understanding every layer of the stack, starting at the instruction level. `sme-jit-core` is where that work begins.
+This is the founding artifact of **[Dawn State](https://github.com/dawn-state)** — an independent research lab exploring the full AI compute stack from silicon to swarms. We believe that pushing the ML frontier requires understanding every layer of the stack, starting at the instruction level. `sme-jit-core` is where that work begins.
 
 ---
 
 <p align="center">
-  <sub>Dawn State · Silicon → Models → Swarms · <a href="https://github.com/dawnstate">github.com/dawnstate</a></sub>
+  <sub>Dawn State · Silicon → Models → Swarms · <a href="https://github.com/dawn-state">github.com/dawn-state</a></sub>
 </p>
