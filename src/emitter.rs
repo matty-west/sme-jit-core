@@ -206,6 +206,11 @@ pub const fn encode_mov_xzr(rd: u8) -> u32 {
     0xD280_0000 | (rd as u32)
 }
 
+/// `ADD Xd, Xn, Xm` — 64-bit register-register add (no shift).
+pub const fn encode_add_x_reg(rd: u8, rn: u8, rm: u8) -> u32 {
+    0x8B00_0000 | ((rm as u32) << 16) | ((rn as u32) << 5) | (rd as u32)
+}
+
 /// `MRS <Xt>, CNTVCT_EL0` — read virtual counter.
 pub const fn encode_mrs_cntvct_el0(rt: u8) -> u32 {
     0xD53BE020 | (rt as u32)
@@ -670,6 +675,241 @@ pub fn build_sme_sgemm_page_cached(
 pub const fn encode_mov_x(rd: u8, rn: u8) -> u32 {
     // ORR Xd, XZR, Xn → 0xAA000000 | (Xn << 16) | (XZR << 5) | Xd
     0xAA00_0000 | ((rn as u32) << 16) | (31 << 5) | (rd as u32)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Gate 21: Tiled SGEMM Kernel Builder
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Build a tiled SME SGEMM kernel for arbitrary M×N×K (Gate 21).
+///
+/// Tiles the computation into 16×16 ZA tile blocks with a branched K-loop
+/// for each tile. Supports fused activation functions.
+///
+/// **Data layout:**
+/// - A: column-major M×K (`A[k*M + i]` = element at row i, column k)
+/// - B: row-major K×N (`B[k*N + j]` = element at row k, column j)
+/// - C: row-major M×N (output)
+/// - Bias: N floats (one per output column)
+///
+/// **Constraints:**
+/// - M, N must be positive multiples of 16
+/// - M, N ≤ 128
+/// - K must be 1..65535
+///
+/// **Register ABI** (designed for cached page calling convention):
+/// - `X0`  = A pointer (passed at call time)
+/// - `X1`  = C pointer (passed at call time)
+/// - `X5`  = B pointer (baked into instruction stream)
+/// - `X6`  = Bias pointer (baked, optional)
+///
+/// **Internal register usage:**
+/// - `X2`  = C tile pointer (current output)
+/// - `X3`  = 0 (zero offset for LD1W/ST1W scalar+scalar)
+/// - `X4`  = A tile pointer (advances by M*4 per K iteration)
+/// - `X7`  = B tile pointer (advances by N*4 per K iteration)
+/// - `X8`  = K loop counter
+/// - `X9`  = scratch (C tile save, offset computation)
+/// - `X10` = A base pointer (preserved across tiles)
+/// - `X11` = C base pointer (preserved across tiles)
+/// - `X12` = W12 = ZA slice counter for ST1W
+/// - `X13` = scratch for bias tile pointer
+pub fn build_sme_tiled_sgemm(m: usize, n: usize, k: usize, act: Activation) -> Vec<u32> {
+    assert!(m % 16 == 0 && m > 0, "M must be a positive multiple of 16, got {}", m);
+    assert!(n % 16 == 0 && n > 0, "N must be a positive multiple of 16, got {}", n);
+    assert!(k > 0 && k <= 65535, "K must be 1..65535, got {}", k);
+    assert!(m <= 128 && n <= 128, "M,N must be ≤ 128, got {}×{}", m, n);
+
+    const TILE: usize = 16;
+    let tiles_m = m / TILE;
+    let tiles_n = n / TILE;
+    let a_k_stride = (m * 4) as u16;    // A: bytes between K-iterations (column stride)
+    let b_k_stride = (n * 4) as u16;    // B: bytes between K-iterations (row stride)
+    let c_row_stride = (n * 4) as u16;  // C: bytes between output rows
+
+    // ── Pre-encode reusable instructions ──
+    let ld1w_z0_x4  = encode_sve_ld1w_ss(0, 0, 4, 3);    // Z0 ← [X4, X3, LSL #2]
+    let ld1w_z1_x7  = encode_sve_ld1w_ss(1, 0, 7, 3);    // Z1 ← [X7, X3, LSL #2]
+    let fmopa_za0   = 0x8081_0000u32;                      // ZA0 += Z0 ⊗ Z1
+    let add_x4_a    = encode_add_x_imm(4, 4, a_k_stride); // X4 += M*4
+    let add_x7_b    = encode_add_x_imm(7, 7, b_k_stride); // X7 += N*4
+    let subs_x8_1   = encode_subs_x_imm(8, 8, 1);         // X8 -= 1, set flags
+    let bne_kloop   = encode_b_ne(-6 * 4);                 // B.NE back 6 insns to LD1W Z0
+
+    let st1w_za0    = encode_sme_st1w_za_h(0, 0, 0, 2, 3);
+    let add_w12_1   = encode_add_w_imm(12, 12, 1);
+    let add_x2_c    = encode_add_x_imm(2, 2, c_row_stride);
+
+    let ld1w_z2_x2  = encode_sve_ld1w_ss(2, 0, 2, 3);
+    let st1w_z2_x2  = encode_sve_st1w_ss(2, 0, 2, 3);
+    let fadd_z2_bias = encode_sve_fadd_unpred(2, 2, 3);
+    let dup_z4_zero = 0x2538_C004u32;    // DUP Z4.S, #0
+    let fmax_z2_z4  = 0x6586_8082u32;    // FMAX Z2.S, P0/M, Z2.S, Z4.S
+
+    let mut block = Vec::with_capacity(1024);
+
+    // ── Preamble: save base pointers, set up constants ──
+    block.push(encode_mov_x(10, 0));   // X10 = A_base (from X0)
+    block.push(encode_mov_x(11, 1));   // X11 = C_base (from X1)
+    block.push(encode_mov_xzr(3));     // X3 = 0 (zero offset)
+    block.push(PTRUE_P0_S);           // P0 = all-true (.S)
+
+    if act == Activation::ReLU || act == Activation::BiasReLU {
+        block.push(dup_z4_zero);       // Z4 = 0.0 (ReLU zero vector, once)
+    }
+
+    // ── Tile loop (fully unrolled at JIT time) ──
+    for ti in 0..tiles_m {
+        for tj in 0..tiles_n {
+            let a_tile_off = (ti * TILE * 4) as u16;  // max 7*64 = 448
+            let b_tile_off = (tj * TILE * 4) as u16;  // max 7*64 = 448
+            let c_tile_off = ti * TILE * n * 4 + tj * TILE * 4;
+
+            // ── A tile pointer: X4 = A_base + ti*64 ──
+            if a_tile_off > 0 {
+                block.push(encode_add_x_imm(4, 10, a_tile_off));
+            } else {
+                block.push(encode_mov_x(4, 10));
+            }
+
+            // ── B tile pointer: X7 = B_base + tj*64 ──
+            if b_tile_off > 0 {
+                block.push(encode_add_x_imm(7, 5, b_tile_off));
+            } else {
+                block.push(encode_mov_x(7, 5));
+            }
+
+            // ── C tile pointer: X2 = C_base + c_tile_off ──
+            if c_tile_off == 0 {
+                block.push(encode_mov_x(2, 11));
+            } else if c_tile_off <= 4095 {
+                block.push(encode_add_x_imm(2, 11, c_tile_off as u16));
+            } else {
+                // Large offset: load into X9 then register-add
+                block.extend(emit_load_imm64_vec(9, c_tile_off as u64));
+                block.push(encode_add_x_reg(2, 11, 9));
+            }
+
+            // ── Load K counter ──
+            block.push(encode_movz_x(8, k as u16, 0));
+
+            // ── ZERO ZA ──
+            block.push(ZERO_ZA);
+
+            // ── K-loop (7 instructions, branch-based) ──
+            // [0] LD1W Z0 ← A column slice
+            // [1] LD1W Z1 ← B row slice
+            // [2] FMOPA ZA0 += Z0 ⊗ Z1
+            // [3] ADD X4 += M*4 (next A column)
+            // [4] ADD X7 += N*4 (next B row)
+            // [5] SUBS X8 -= 1
+            // [6] B.NE → [0]
+            block.push(ld1w_z0_x4);
+            block.push(ld1w_z1_x7);
+            block.push(fmopa_za0);
+            block.push(add_x4_a);
+            block.push(add_x7_b);
+            block.push(subs_x8_1);
+            block.push(bne_kloop);
+
+            // ── Store ZA rows to C ──
+            block.push(encode_mov_x(9, 2));     // X9 = save C_tile_start
+            block.push(0x5280_000Cu32);         // MOV W12, #0
+
+            for _row in 0..TILE {
+                block.push(st1w_za0);
+                block.push(add_w12_1);
+                block.push(add_x2_c);
+            }
+
+            // ── Activation pass (if any) ──
+            if act != Activation::None {
+                block.push(encode_mov_x(2, 9));  // Restore X2 to C_tile_start
+
+                // Load bias slice for this tile's columns
+                if act == Activation::Bias || act == Activation::BiasReLU {
+                    if b_tile_off > 0 {
+                        block.push(encode_add_x_imm(13, 6, b_tile_off));
+                        block.push(encode_sve_ld1w_ss(3, 0, 13, 3));
+                    } else {
+                        block.push(encode_sve_ld1w_ss(3, 0, 6, 3));
+                    }
+                }
+
+                for _row in 0..TILE {
+                    block.push(ld1w_z2_x2);
+                    match act {
+                        Activation::ReLU => {
+                            block.push(fmax_z2_z4);
+                        }
+                        Activation::Bias => {
+                            block.push(fadd_z2_bias);
+                        }
+                        Activation::BiasReLU => {
+                            block.push(fadd_z2_bias);
+                            block.push(fmax_z2_z4);
+                        }
+                        Activation::None => unreachable!(),
+                    }
+                    block.push(st1w_z2_x2);
+                    block.push(add_x2_c);
+                }
+            }
+        }
+    }
+
+    block
+}
+
+/// Build a **cached** JIT page for tiled SME SGEMM (Gate 21).
+///
+/// Immutable pointers (B weights, bias) are baked into the instruction stream.
+/// Mutable pointers (A input, C output) are passed at call time via X0, X1.
+///
+/// Call via `page.call_with_args(a_ptr as u64, c_ptr as u64)`.
+///
+/// **Data layout:**
+/// - A (X0): column-major M×K
+/// - C (X1): row-major M×N (output)
+/// - B (baked): row-major K×N
+/// - Bias (baked): N floats
+pub fn build_sme_tiled_sgemm_page_cached(
+    m: usize,
+    n: usize,
+    k: usize,
+    act: Activation,
+    b_ptr: u64,
+    bias_ptr: u64,
+) -> Option<crate::jit_page::JitPage> {
+    let kernel = build_sme_tiled_sgemm(m, n, k, act);
+
+    let mut insns = Vec::with_capacity(20 + kernel.len() + 3);
+
+    // Bake immutable pointers before SMSTART
+    insns.extend(emit_load_imm64_vec(5, b_ptr));    // X5 = B (weights)
+    if act == Activation::Bias || act == Activation::BiasReLU {
+        insns.extend(emit_load_imm64_vec(6, bias_ptr)); // X6 = Bias
+    }
+
+    insns.push(SMSTART);
+    insns.extend_from_slice(&kernel);
+    insns.push(SMSTOP);
+    insns.push(RET);
+
+    let total_bytes = insns.len() * 4;
+    let page_size = ((total_bytes + 16383) / 16384) * 16384;
+
+    let page = crate::jit_page::JitPage::alloc(page_size).ok()?;
+    page.make_writable();
+
+    let mut off = 0;
+    for &op in &insns {
+        page.write_instruction(off, op);
+        off += 4;
+    }
+
+    page.make_executable();
+    Some(page)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
