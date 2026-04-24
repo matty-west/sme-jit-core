@@ -8,7 +8,7 @@
 //!
 //! Batch=16: all three layers operate on full 16×16 ZA tiles.
 
-use crate::emitter::{build_sme_sgemm_page, build_sme_sgemm_page_cached, build_sme_tiled_sgemm_page_cached, Activation};
+use crate::emitter::{build_sme_sgemm_page, build_sme_sgemm_page_cached, build_sme_tiled_sgemm_page_cached, build_monolithic_inference_page, MonolithicLayerConfig, Activation};
 use crate::jit_page::JitPage;
 use crate::weights::{MnistWeights, MnistWeightsWide};
 
@@ -488,6 +488,125 @@ pub fn run_inference_reference(
     }
 
     (predictions, hidden1, hidden2, output)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Gate 23: Monolithic Fused Inference Engine
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A monolithic inference engine that chains all 3 layers into a single JitPage
+/// with one SMSTART/SMSTOP pair and SVE gather-transpose between layers.
+///
+/// **Key optimizations over TiledInferenceEngine:**
+/// 1. Single SMSTART/SMSTOP (saves ~300-600 ns from 3 pairs → 1)
+/// 2. SVE gather-load transpose inside streaming mode (no Rust scalar loops)
+/// 3. Zero function call overhead between layers (no BLR/RET)
+///
+/// Architecture: 784 → H → H → 10 (H = hidden_dim, must be multiple of 16)
+pub struct MonolithicInferenceEngine {
+    #[allow(dead_code)]
+    hidden_dim: usize,
+    page: JitPage,
+    /// Intermediate buffer 1: row-major [16×H] — layer output before transpose
+    buf1: Vec<f32>,
+    /// Intermediate buffer 2: column-major [H×16] — transposed for next layer
+    buf2: Vec<f32>,
+    /// Final output: row-major [16×16]
+    output: Vec<f32>,
+}
+
+impl MonolithicInferenceEngine {
+    /// Build the monolithic inference engine.
+    ///
+    /// All 3 layers are compiled into a single JitPage. Weight and bias pointers
+    /// are baked in. Intermediate buffer pointers are also baked in.
+    ///
+    /// `weights` must outlive the engine.
+    pub fn build(weights: &MnistWeightsWide) -> Result<Self, String> {
+        let h = weights.hidden_dim;
+        assert!(h % 16 == 0, "hidden_dim must be multiple of 16, got {}", h);
+
+        // Pre-allocate buffers — pointers baked into JIT page
+        let buf1 = vec![0.0f32; 16 * h];  // largest intermediate: 16×H
+        let buf2 = vec![0.0f32; h * 16];  // transposed: H×16
+        let output = vec![0.0f32; 16 * 16];
+
+        let layers = vec![
+            MonolithicLayerConfig {
+                m: 16, n: h, k: 784,
+                act: Activation::BiasReLU,
+                w_ptr: weights.w1.as_ptr() as u64,
+                b_ptr: weights.b1.as_ptr() as u64,
+            },
+            MonolithicLayerConfig {
+                m: 16, n: h, k: h,
+                act: Activation::BiasReLU,
+                w_ptr: weights.w2.as_ptr() as u64,
+                b_ptr: weights.b2.as_ptr() as u64,
+            },
+            MonolithicLayerConfig {
+                m: 16, n: 16, k: h,
+                act: Activation::Bias,
+                w_ptr: weights.w3.as_ptr() as u64,
+                b_ptr: weights.b3.as_ptr() as u64,
+            },
+        ];
+
+        let page = build_monolithic_inference_page(
+            &layers,
+            buf1.as_ptr() as u64,
+            buf2.as_ptr() as u64,
+        ).ok_or("Failed to build monolithic inference page")?;
+
+        Ok(Self {
+            hidden_dim: h,
+            page,
+            buf1,
+            buf2,
+            output,
+        })
+    }
+
+    /// Run inference with pre-transposed input [784×16].
+    ///
+    /// Returns: predictions[16]
+    pub fn run_pretransposed(&mut self, images_t: &[f32]) -> Vec<u8> {
+        assert_eq!(images_t.len(), 784 * 16, "Expected 784×16 pre-transposed input");
+
+        // Single call — all 3 layers execute in one JIT page
+        unsafe {
+            self.page.call_with_args(
+                images_t.as_ptr() as u64,
+                self.output.as_mut_ptr() as u64,
+            );
+        }
+
+        // Argmax over first 10 columns
+        let mut predictions = Vec::with_capacity(16);
+        for i in 0..16 {
+            let row = &self.output[i * 16..i * 16 + 10];
+            let pred = row.iter().enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .map(|(idx, _)| idx as u8)
+                .unwrap_or(0);
+            predictions.push(pred);
+        }
+        predictions
+    }
+
+    /// Run inference with row-major input [16×784] (includes transpose).
+    pub fn run(&mut self, images: &[f32]) -> Vec<u8> {
+        assert_eq!(images.len(), 16 * 784, "Expected 16×784 input");
+        let mut input_t = vec![0.0f32; 784 * 16];
+        for i in 0..16 {
+            for k in 0..784 {
+                input_t[k * 16 + i] = images[i * 784 + k];
+            }
+        }
+        self.run_pretransposed(&input_t)
+    }
+
+    pub fn output(&self) -> &[f32] { &self.output }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

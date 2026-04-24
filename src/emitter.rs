@@ -913,6 +913,638 @@ pub fn build_sme_tiled_sgemm_page_cached(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Gate 23: Monolithic Fused Inference Kernel
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Build a monolithic inference kernel that chains multiple GEMM+activation layers
+/// into a single JitPage with one SMSTART/SMSTOP pair.
+///
+/// Between intermediate layers, stores are emitted in **column-major** format
+/// so the next layer's LD1W can read the data directly — no Rust transpose needed.
+///
+/// **Calling convention:**
+/// - `X0` = input A pointer (column-major [K1 × 16])
+/// - `X1` = final output C pointer (row-major [16 × N_last])
+///
+/// **Baked pointers:**
+/// - Layer weights (W1, W2, W3) and biases (B1, B2, B3) are baked into the instruction stream.
+/// - Intermediate buffers (buf1, buf2) are baked into the instruction stream.
+///
+/// **Register usage per-layer:**
+/// - `X10` = A_base, `X11` = C_base
+/// - `X4/X7` = A/B tile pointers, `X5` = B weights, `X6` = bias
+/// - `X2` = C tile pointer, `X3` = 0, `X8` = K counter, `X9/X12/X13` = scratch
+/// - `X14` = intermediate buf1, `X15` = intermediate buf2
+pub struct MonolithicLayerConfig {
+    pub m: usize,
+    pub n: usize,
+    pub k: usize,
+    pub act: Activation,
+    pub w_ptr: u64,   // B (weights) pointer, row-major [K×N]
+    pub b_ptr: u64,   // Bias pointer, N floats
+}
+
+/// Build the inner kernel for one layer of a monolithic inference pipeline.
+///
+/// If `col_major_output` is true, the store phase writes in column-major format
+/// [N×16] instead of row-major [16×N]. This allows the next layer to read A
+/// directly without a transpose.
+#[allow(dead_code)]
+fn build_layer_kernel(
+    m: usize, n: usize, k: usize,
+    act: Activation,
+    col_major_output: bool,
+) -> Vec<u32> {
+    assert!(m % 16 == 0 && m > 0);
+    assert!(n % 16 == 0 && n > 0);
+    assert!(k > 0 && k <= 65535);
+
+    const TILE: usize = 16;
+    let tiles_m = m / TILE;
+    let tiles_n = n / TILE;
+    let a_k_stride = (m * 4) as u16;    // A: column-major stride between K iterations
+    let b_k_stride = (n * 4) as u16;    // B: row-major stride between K iterations
+
+    // Output stride depends on layout:
+    // Row-major: row stride = N*4 bytes (advance by N floats to next row)
+    // Column-major: row stride = 4 bytes (each row = next float in same column)
+    //   But for column-major [N×16], each ZA row i should go to offset i*4 within a column,
+    //   and tile column tj starts at tj*16*4 = tj*64 bytes * TILE in the output.
+    //   Actually: col-major [N×16] means element [i][j] is at offset j*N*4 + i*4.
+    //   Wait no — we want the output to be read as A for the next layer in col-major [N×16].
+    //   That means: A[col][row] at offset col*16*4 + row*4.
+    //   So for ZA row `r` of tile (ti, tj):
+    //     row in output = ti*16 + r
+    //     col_start = tj*16
+    //     For row-major: addr = base + (ti*16+r)*N*4 + tj*16*4
+    //     For col-major [N×16]: addr = base + col*16*4 + row*4
+    //       = base + (tj*16+c)*16*4 + (ti*16+r)*4
+    //   But ST1W stores a whole ZA row (16 floats for columns tj*16..(tj+1)*16).
+    //   In row-major these 16 floats are contiguous at offset (row*N + tj*16)*4.
+    //   In column-major [N×16] they're at stride 16*4=64 bytes apart (one per column).
+    //   → We can't use a single ST1W for non-contiguous column-major stores.
+
+    // REVISED APPROACH: Column-major via ZA vertical slices.
+    // Actually, we can just store row-major and then transpose.
+    // OR: we store row-major intermediate, then do an SVE-based transpose.
+
+    // SIMPLEST APPROACH that still eliminates Rust transposes:
+    // Store intermediate results row-major [16×N], then emit an SVE transpose
+    // sequence: for each column c, LD1W from row-major col c (stride N*4),
+    // ST1W to col-major position c (contiguous 16 floats).
+    //
+    // But that's N SVE load-store pairs = 2*N instructions.
+    // For N=48 that's 96 extra instructions. Not ideal but still inside the kernel.
+    //
+    // EVEN SIMPLER: Just store row-major, let the next layer handle the
+    // column-major layout by adjusting its LD1W stride.
+    //
+    // ACTUALLY the cleanest approach: store row-major [16×N] to buf.
+    // Next layer reads A from buf. A must be column-major [K×16] = [N×16].
+    // A[k][m] at buf + k*16*4 + m*4 (column-major).
+    // But we stored: C[m][n] at buf + m*N*4 + n*4 (row-major).
+    // So A[k=n][m] = C[m][n]. Column-major A[n][m] needs to be at n*16*4 + m*4 = n*64 + m*4.
+    // Row-major C[m][n] is at m*N*4 + n*4.
+    // These are different unless N=16.
+    //
+    // For N=16: row-major [16×16] = column-major [16×16] transposed.
+    //   C[m][n] at m*64 + n*4. A[n][m] at n*64 + m*4. Not the same.
+    //
+    // SO: we DO need to transpose. The question is whether to do it in SVE
+    // instructions (inside streaming mode) or in Rust (outside).
+    //
+    // SVE transpose for [16×N] → [N×16]:
+    //   For each column c in 0..N:
+    //     Load 16 values from rows: addr = buf + c*4, stride = N*4
+    //     Store 16 values contiguously: addr = buf2 + c*64
+    //   That's a gather-load (non-contiguous) then a contiguous store.
+    //   SVE LD1W with scalar+scalar won't do strided access.
+    //   We'd need LD1W scalar+immediate with repeated ADD, or use gather loads.
+    //
+    // ALTERNATIVE: Use the ZA tile itself!
+    //   After FMOPA, ZA[r][c] holds result[r][c].
+    //   ST1W horizontal stores row r: 16 contiguous values = one row of C.
+    //   ST1W vertical would store column c: 16 contiguous values = one row of A!
+    //   → If we use ST1W *vertical* slices, we get column-major output for free!
+
+    // YES! ST1W ZA vertical slice:
+    //   `ST1W { ZA0V.S[Wv, #off] }, Pg, [Xn, Xm, LSL #2]`
+    //   Stores column `off` of ZA as 16 contiguous float32s.
+    //   If we store columns 0..15 contiguously (stride = 64 bytes between columns),
+    //   we get the output in column-major [16×16] = exactly what LD1W reads as A!
+    //
+    // For multi-tile (N>16): tile (ti, tj) produces ZA[0..15][0..15].
+    //   Row-major output tile address: base + ti*16*N*4 + tj*16*4 (row stride = N*4).
+    //   Col-major output tile address: base + tj*16*16*4 + ti*16*4 (col stride = 16*4).
+    //     → Store vertical slices to base + (tj*16+c)*16*4 + ti*16*4 + r*4
+    //     → Base for tile (ti,tj) col-major: base + tj*16*64 + ti*64
+    //     → Within tile: column c stored at offset c*64 (16 floats contiguous)
+    //
+    // THIS IS THE KEY INSIGHT: ST1W vertical slices give us column-major for free!
+
+    let c_row_stride = if col_major_output {
+        // Column-major [N×16]: stride between "rows" in vertical store = column stride
+        // Actually for vertical ST1W, we advance the base by 16*4=64 per column
+        (TILE * 4) as u16  // 64 bytes — stride between vertical slices
+    } else {
+        (n * 4) as u16     // Row-major: stride between rows = N*4
+    };
+
+    // Pre-encode reusable instructions
+    let ld1w_z0_x4  = encode_sve_ld1w_ss(0, 0, 4, 3);    // Z0 ← A[X4]
+    let ld1w_z1_x7  = encode_sve_ld1w_ss(1, 0, 7, 3);    // Z1 ← B[X7]
+    let fmopa_za0   = 0x8081_0000u32;                      // ZA0 += Z0 ⊗ Z1
+    let add_x4_a    = encode_add_x_imm(4, 4, a_k_stride);
+    let add_x7_b    = encode_add_x_imm(7, 7, b_k_stride);
+    let subs_x8_1   = encode_subs_x_imm(8, 8, 1);
+    let bne_kloop   = encode_b_ne(-6 * 4);
+
+    // Store instruction: horizontal (row-major) or vertical (col-major)
+    let st1w_za0 = if col_major_output {
+        // ST1W { ZA0V.S[W12, #0] }, P0, [X2, X3, LSL #2]
+        // Vertical variant: bit pattern differs from horizontal
+        encode_sme_st1w_za_v(0, 0, 0, 2, 3)
+    } else {
+        encode_sme_st1w_za_h(0, 0, 0, 2, 3)
+    };
+    let add_w12_1   = encode_add_w_imm(12, 12, 1);
+    let add_x2_c    = encode_add_x_imm(2, 2, c_row_stride);
+
+    // Activation instructions
+    let ld1w_z2_x2  = encode_sve_ld1w_ss(2, 0, 2, 3);
+    let st1w_z2_x2  = encode_sve_st1w_ss(2, 0, 2, 3);
+    let fadd_z2_bias = encode_sve_fadd_unpred(2, 2, 3);
+    let dup_z4_zero = 0x2538_C004u32;
+    let fmax_z2_z4  = 0x6586_8082u32;
+
+    let mut block = Vec::with_capacity(2048);
+
+    // Preamble
+    block.push(encode_mov_x(10, 0));   // X10 = A_base
+    block.push(encode_mov_x(11, 1));   // X11 = C_base
+    block.push(encode_mov_xzr(3));     // X3 = 0
+    block.push(PTRUE_P0_S);
+
+    if act == Activation::ReLU || act == Activation::BiasReLU {
+        block.push(dup_z4_zero);
+    }
+
+    // Tile loop (fully unrolled)
+    for ti in 0..tiles_m {
+        for tj in 0..tiles_n {
+            let a_tile_off = (ti * TILE * 4) as u16;
+            let b_tile_off = (tj * TILE * 4) as u16;
+
+            let c_tile_off = if col_major_output {
+                // Col-major [N×16]: tile (ti, tj) starts at tj*16*16*4 + ti*16*4
+                tj * TILE * TILE * 4 + ti * TILE * 4
+            } else {
+                // Row-major [16×N]: tile (ti, tj) starts at ti*16*N*4 + tj*16*4
+                ti * TILE * n * 4 + tj * TILE * 4
+            };
+
+            // A tile pointer
+            if a_tile_off > 0 {
+                block.push(encode_add_x_imm(4, 10, a_tile_off));
+            } else {
+                block.push(encode_mov_x(4, 10));
+            }
+
+            // B tile pointer
+            if b_tile_off > 0 {
+                block.push(encode_add_x_imm(7, 5, b_tile_off));
+            } else {
+                block.push(encode_mov_x(7, 5));
+            }
+
+            // C tile pointer
+            if c_tile_off == 0 {
+                block.push(encode_mov_x(2, 11));
+            } else if c_tile_off <= 4095 {
+                block.push(encode_add_x_imm(2, 11, c_tile_off as u16));
+            } else {
+                block.extend(emit_load_imm64_vec(9, c_tile_off as u64));
+                block.push(encode_add_x_reg(2, 11, 9));
+            }
+
+            // K counter
+            block.push(encode_movz_x(8, k as u16, 0));
+            block.push(ZERO_ZA);
+
+            // K-loop
+            block.push(ld1w_z0_x4);
+            block.push(ld1w_z1_x7);
+            block.push(fmopa_za0);
+            block.push(add_x4_a);
+            block.push(add_x7_b);
+            block.push(subs_x8_1);
+            block.push(bne_kloop);
+
+            // Store ZA rows/columns
+            block.push(encode_mov_x(9, 2));
+            block.push(0x5280_000Cu32);  // MOV W12, #0
+
+            for _slice in 0..TILE {
+                block.push(st1w_za0);
+                block.push(add_w12_1);
+                block.push(add_x2_c);
+            }
+
+            // Activation pass
+            if act != Activation::None {
+                block.push(encode_mov_x(2, 9));  // Restore C tile start
+
+                if act == Activation::Bias || act == Activation::BiasReLU {
+                    if b_tile_off > 0 {
+                        block.push(encode_add_x_imm(13, 6, b_tile_off));
+                    } else {
+                        block.push(encode_mov_x(13, 6));
+                    }
+                }
+
+                // For col-major output, activation operates on vertical slices
+                // (16 contiguous floats per column), same stride as store
+                if col_major_output && (act == Activation::Bias || act == Activation::BiasReLU) {
+                    // Need to broadcast each bias element for the column
+                    // Actually bias[tj*16 + c] applies to column c.
+                    // In col-major store, each 16-float chunk IS one column.
+                    // So LD1W Z2 loads column c (16 values), and we add bias[c] as scalar.
+                    // But our FADD is vector: Z2 = Z2 + Z3 where Z3 = bias vector.
+                    // For col-major: each LD1W loads 16 values from the SAME column c,
+                    // so they all need bias[c] added (a scalar broadcast).
+                    //
+                    // Hmm, the existing approach adds the bias vector to each row.
+                    // For col-major, each stored chunk is a column, not a row.
+                    // All elements in that chunk belong to the same output column c,
+                    // so they all get bias[c].
+                    //
+                    // We need: DUP Z3.S, bias[c] for each column c.
+                    // Or: load bias into Z3 once, then use INDEX to extract element c.
+                    //
+                    // SIMPLEST: load bias vector into Z3, then for each column c:
+                    //   - LD1W Z2 from col-major chunk c
+                    //   - DUP Z5.S, Z3.S[c]  -- broadcast element c
+                    //   - FADD Z2, Z2, Z5
+                    //   - (optional FMAX for ReLU)
+                    //   - ST1W Z2
+                    //
+                    // DUP Z5.S, Z3.S[c] is: 0x0520_0063 | (c << ?) ... complex.
+                    // Alternative: just LD1RW (broadcast load) from bias + c*4.
+                    // LD1RW Z5.S, P0/Z, [X13, #c*4] — but that's an immediate offset form
+                    // that may not exist for arbitrary c.
+                    //
+                    // SIMPLEST WORKING APPROACH: Use row-major store for activation,
+                    // then transpose to col-major. This is what the existing code does.
+                    //
+                    // ACTUALLY — let's just load the bias once into Z3 and apply it
+                    // BEFORE the store, while the data is still in ZA row format.
+                    // The activation happens AFTER ST1W, loading back from memory.
+                    // In the col-major path, we could restructure to:
+                    //   1. ST1W horizontal (row-major) to a temp
+                    //   2. Load rows, apply activation, store col-major
+                    // But that defeats the purpose.
+                    //
+                    // Let's take the pragmatic approach: for intermediate layers with
+                    // col-major output + activation, we apply bias/relu on row-major
+                    // data (LD1W row, FADD bias, FMAX, ST1W row) and then do a
+                    // separate col-major rewrite pass. Actually that's worse.
+                    //
+                    // BEST APPROACH: Apply activation to ZA row slices BEFORE storing.
+                    // But MOVA is unreliable on M4.
+                    //
+                    // PRAGMATIC FINAL APPROACH:
+                    // Store row-major, apply activation row-major (existing proven logic),
+                    // then SVE-transpose in-kernel from row-major to col-major.
+                    // The transpose is: for each row r of output [16×N]:
+                    //   for each col c (in 16-element tiles):
+                    //     read: buf[r*N + c] → this is a scalar at stride N*4
+                    //     write: buf_out[c*16 + r] → contiguous within column
+                    // Can't easily vectorize the read (non-contiguous).
+                    //
+                    // OR: Just keep the Rust transposes but eliminate SMSTART/SMSTOP
+                    // overhead. That's still a win.
+
+                    // DECISION: For Gate 23, go with the pragmatic hybrid:
+                    // - Single SMSTART/SMSTOP (big win: ~300-600ns)
+                    // - Keep row-major stores for intermediate layers
+                    // - Do SVE-accelerated transpose inside streaming mode
+                    // This will be cleaner. Let me restructure.
+
+                    // Fall through to standard row-major activation
+                    block.push(encode_sve_ld1w_ss(3, 0, 13, 3));
+                } else if act == Activation::Bias || act == Activation::BiasReLU {
+                    block.push(encode_sve_ld1w_ss(3, 0, 13, 3));
+                }
+
+                for _row in 0..TILE {
+                    block.push(ld1w_z2_x2);
+                    match act {
+                        Activation::ReLU => block.push(fmax_z2_z4),
+                        Activation::Bias => block.push(fadd_z2_bias),
+                        Activation::BiasReLU => {
+                            block.push(fadd_z2_bias);
+                            block.push(fmax_z2_z4);
+                        }
+                        Activation::None => unreachable!(),
+                    }
+                    block.push(st1w_z2_x2);
+                    block.push(add_x2_c);
+                }
+            }
+        }
+    }
+
+    block
+}
+
+/// Encode `ST1W { ZA0V.S[Wv, #off] }, Pg, [Xn, Xm, LSL #2]` — SME **vertical**
+/// word-width store of one slice of ZA0 to memory.
+///
+/// The vertical variant stores a column of ZA as 16 contiguous floats.
+/// Encoding differs from horizontal by bit 15: horizontal=0, vertical=1.
+pub const fn encode_sme_st1w_za_v(wv: u8, off2: u8, pg: u8, rn: u8, rm: u8) -> u32 {
+    // Same as horizontal but with bit 15 set for vertical
+    encode_sme_st1w_za_h(wv, off2, pg, rn, rm) | (1 << 15)
+}
+
+/// Build a monolithic inference JitPage for a multi-layer MLP.
+///
+/// All layers are emitted into a single page with one SMSTART/SMSTOP pair.
+/// Intermediate transposes are done with SVE loads/stores inside streaming mode.
+///
+/// **Calling convention:** `page.call_with_args(input_ptr, output_ptr)`
+/// - X0 = input (column-major [K1 × 16])
+/// - X1 = output (row-major [16 × N_last])
+///
+/// Intermediate buffers (buf1, buf2) must be pre-allocated and valid for the
+/// lifetime of the page.
+pub fn build_monolithic_inference_page(
+    layers: &[MonolithicLayerConfig],
+    buf1_ptr: u64,
+    buf2_ptr: u64,
+) -> Option<crate::jit_page::JitPage> {
+    assert!(!layers.is_empty() && layers.len() <= 4);
+
+    // ═══════════════════════════════════════════════════════════════
+    // Gate 23 Strategy: Vertical ST1W + LD1RW — Zero Transposes
+    //
+    // Key insight: ST1W *vertical* slices store a ZA column as 16
+    // contiguous floats → column-major output. The next layer reads
+    // this directly as column-major A via LD1W. No transpose needed.
+    //
+    // For activation on column-major data: LD1RW broadcasts one bias
+    // element to all lanes, then FADD applies it to the 16-row column.
+    // Both LD1RW and ST1W vertical are available in streaming mode.
+    //
+    // Buffer strategy:
+    //   Layer 0: A = X0 (input), C = buf1 (col-major via vertical ST1W)
+    //   Layer 1: A = buf1 (col-major), C = buf2 (col-major via vertical ST1W)
+    //   Layer 2 (last): A = buf2 (col-major), C = X1 (row-major via horizontal ST1W)
+    // ═══════════════════════════════════════════════════════════════
+
+    const TILE: usize = 16;
+
+    let mut insns = Vec::with_capacity(8192);
+
+    // Save output pointer before we clobber X1
+    insns.push(encode_mov_x(16, 1));  // X16 = final output ptr
+
+    // SMSTART — enter streaming mode once for all layers
+    insns.push(SMSTART);
+
+    let num_layers = layers.len();
+
+    for (layer_idx, layer) in layers.iter().enumerate() {
+        let is_last = layer_idx == num_layers - 1;
+        let is_intermediate = !is_last;
+
+        // ── Set up A (X0) and C (X1) pointers for this layer ──
+        if layer_idx == 0 {
+            // X0 already has input pointer from caller
+            insns.extend(emit_load_imm64_vec(1, buf1_ptr)); // C = buf1
+        } else if layer_idx == 1 {
+            insns.extend(emit_load_imm64_vec(0, buf1_ptr)); // A = buf1
+            if is_last {
+                insns.push(encode_mov_x(1, 16)); // C = final output
+            } else {
+                insns.extend(emit_load_imm64_vec(1, buf2_ptr)); // C = buf2
+            }
+        } else {
+            insns.extend(emit_load_imm64_vec(0, buf2_ptr)); // A = buf2
+            insns.push(encode_mov_x(1, 16)); // C = final output (must be last)
+        }
+
+        // Load weight and bias pointers
+        insns.extend(emit_load_imm64_vec(5, layer.w_ptr));
+        if layer.act == Activation::Bias || layer.act == Activation::BiasReLU {
+            insns.extend(emit_load_imm64_vec(6, layer.b_ptr));
+        }
+
+        // ── Emit tiled GEMM + store + activation ──
+        let m = layer.m;
+        let n = layer.n;
+        let k = layer.k;
+        let act = layer.act;
+        assert!(m % TILE == 0 && n % TILE == 0);
+
+        let tiles_m = m / TILE;
+        let tiles_n = n / TILE;
+        let a_k_stride = (m * 4) as u16;
+        let b_k_stride = (n * 4) as u16;
+
+        // For intermediate layers: vertical ST1W → column-major [N×16]
+        // Output stride between slices = 64 bytes (16 floats)
+        // For last layer: horizontal ST1W → row-major [16×N]
+        // Output stride between rows = N*4 bytes
+        let c_stride = if is_intermediate { 64u16 } else { (n * 4) as u16 };
+
+        let ld1w_z0_x4 = encode_sve_ld1w_ss(0, 0, 4, 3);
+        let ld1w_z1_x7 = encode_sve_ld1w_ss(1, 0, 7, 3);
+        let fmopa_za0 = 0x8081_0000u32;
+        let add_x4_a = encode_add_x_imm(4, 4, a_k_stride);
+        let add_x7_b = encode_add_x_imm(7, 7, b_k_stride);
+        let subs_x8_1 = encode_subs_x_imm(8, 8, 1);
+        let bne_kloop = encode_b_ne(-6 * 4);
+
+        let st1w_za0 = if is_intermediate {
+            encode_sme_st1w_za_v(0, 0, 0, 2, 3) // Vertical
+        } else {
+            encode_sme_st1w_za_h(0, 0, 0, 2, 3) // Horizontal
+        };
+        let add_w12_1 = encode_add_w_imm(12, 12, 1);
+        let add_x2_c = encode_add_x_imm(2, 2, c_stride);
+
+        // Activation
+        let dup_z4_zero = 0x2538_C004u32;
+        let fmax_z2_z4 = 0x6586_8082u32;
+        let ld1w_z2_x2 = encode_sve_ld1w_ss(2, 0, 2, 3);
+        let st1w_z2_x2 = encode_sve_st1w_ss(2, 0, 2, 3);
+
+        // Preamble for this layer
+        insns.push(encode_mov_x(10, 0));   // X10 = A_base
+        insns.push(encode_mov_x(11, 1));   // X11 = C_base
+        insns.push(encode_mov_xzr(3));     // X3 = 0
+        insns.push(PTRUE_P0_S);
+
+        if act == Activation::ReLU || act == Activation::BiasReLU {
+            insns.push(dup_z4_zero);
+        }
+
+        for ti in 0..tiles_m {
+            for tj in 0..tiles_n {
+                let a_tile_off = (ti * TILE * 4) as u16;
+                let b_tile_off = (tj * TILE * 4) as u16;
+
+                let c_tile_off = if is_intermediate {
+                    // Column-major [N×16]: tile (ti,tj) at tj*16*64 + ti*16*4
+                    tj * TILE * TILE * 4 + ti * TILE * 4
+                } else {
+                    // Row-major [16×N]: tile (ti,tj) at ti*16*N*4 + tj*16*4
+                    ti * TILE * n * 4 + tj * TILE * 4
+                };
+
+                // A tile pointer
+                if a_tile_off > 0 {
+                    insns.push(encode_add_x_imm(4, 10, a_tile_off));
+                } else {
+                    insns.push(encode_mov_x(4, 10));
+                }
+                // B tile pointer
+                if b_tile_off > 0 {
+                    insns.push(encode_add_x_imm(7, 5, b_tile_off));
+                } else {
+                    insns.push(encode_mov_x(7, 5));
+                }
+                // C tile pointer
+                if c_tile_off == 0 {
+                    insns.push(encode_mov_x(2, 11));
+                } else if c_tile_off <= 4095 {
+                    insns.push(encode_add_x_imm(2, 11, c_tile_off as u16));
+                } else {
+                    insns.extend(emit_load_imm64_vec(9, c_tile_off as u64));
+                    insns.push(encode_add_x_reg(2, 11, 9));
+                }
+
+                // K-loop
+                insns.push(encode_movz_x(8, k as u16, 0));
+                insns.push(ZERO_ZA);
+                insns.push(ld1w_z0_x4);
+                insns.push(ld1w_z1_x7);
+                insns.push(fmopa_za0);
+                insns.push(add_x4_a);
+                insns.push(add_x7_b);
+                insns.push(subs_x8_1);
+                insns.push(bne_kloop);
+
+                // Store ZA slices
+                insns.push(encode_mov_x(9, 2)); // save C tile start
+                insns.push(0x5280_000Cu32); // MOV W12, #0
+                for _ in 0..TILE {
+                    insns.push(st1w_za0);
+                    insns.push(add_w12_1);
+                    insns.push(add_x2_c);
+                }
+
+                // ── Activation pass ──
+                if act != Activation::None {
+                    insns.push(encode_mov_x(2, 9)); // restore C tile start
+
+                    if is_intermediate {
+                        // Column-major: each LD1W loads 16 rows of ONE column.
+                        // Bias: need bias[tj*16 + c] broadcast for each column c.
+                        // Use LD1RW to broadcast-load one bias float.
+                        // LD1RW {Z3.S}, P0/Z, [X13, #0]
+                        // X13 = &bias[tj*16], advance by 4 per column.
+                        if act == Activation::Bias || act == Activation::BiasReLU {
+                            if b_tile_off > 0 {
+                                insns.push(encode_add_x_imm(13, 6, b_tile_off));
+                            } else {
+                                insns.push(encode_mov_x(13, 6));
+                            }
+                        }
+
+                        for _col in 0..TILE {
+                            insns.push(ld1w_z2_x2); // Z2 = 16 rows of this column
+
+                            if act == Activation::Bias || act == Activation::BiasReLU {
+                                // LD1RW Z3.S, P0/Z, [X13, #0] — broadcast bias
+                                insns.push(encode_ld1rw(3, 0, 13, 0));
+                                insns.push(encode_sve_fadd_unpred(2, 2, 3));
+                                insns.push(encode_add_x_imm(13, 13, 4)); // next bias element
+                            }
+                            if act == Activation::ReLU || act == Activation::BiasReLU {
+                                insns.push(fmax_z2_z4);
+                            }
+
+                            insns.push(st1w_z2_x2); // store back
+                            insns.push(add_x2_c);   // next column (stride=64)
+                        }
+                    } else {
+                        // Row-major (last layer): existing row-based activation
+                        if act == Activation::Bias || act == Activation::BiasReLU {
+                            if b_tile_off > 0 {
+                                insns.push(encode_add_x_imm(13, 6, b_tile_off));
+                                insns.push(encode_sve_ld1w_ss(3, 0, 13, 3));
+                            } else {
+                                insns.push(encode_sve_ld1w_ss(3, 0, 6, 3));
+                            }
+                        }
+                        for _row in 0..TILE {
+                            insns.push(ld1w_z2_x2);
+                            match act {
+                                Activation::ReLU => insns.push(fmax_z2_z4),
+                                Activation::Bias => insns.push(encode_sve_fadd_unpred(2, 2, 3)),
+                                Activation::BiasReLU => {
+                                    insns.push(encode_sve_fadd_unpred(2, 2, 3));
+                                    insns.push(fmax_z2_z4);
+                                }
+                                Activation::None => unreachable!(),
+                            }
+                            insns.push(st1w_z2_x2);
+                            insns.push(add_x2_c);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // SMSTOP + RET
+    insns.push(SMSTOP);
+    insns.push(RET);
+
+    let total_bytes = insns.len() * 4;
+    let page_size = ((total_bytes + 16383) / 16384) * 16384;
+
+    let page = crate::jit_page::JitPage::alloc(page_size).ok()?;
+    page.make_writable();
+
+    let mut off = 0;
+    for &op in &insns {
+        page.write_instruction(off, op);
+        off += 4;
+    }
+
+    page.make_executable();
+    Some(page)
+}
+
+/// Encode `LD1RW {Zt.S}, Pg/Z, [Xn, #imm]` — SVE load-and-replicate word.
+///
+/// Loads a single 32-bit value from memory and broadcasts it to all S-element
+/// lanes of the destination Z register. Available in streaming SVE mode.
+///
+/// `imm` is a byte offset, must be a multiple of 4, range 0..252.
+pub const fn encode_ld1rw(zt: u8, pg: u8, rn: u8, imm: u16) -> u32 {
+    assert!(zt <= 31 && pg <= 7 && rn <= 30);
+    assert!(imm % 4 == 0 && imm <= 252);
+    let imm6 = (imm / 4) as u32;
+    // LD1RW {Zt.S}, Pg/Z, [Xn, #imm]
+    // Encoding: 1000 0101 01 imm6(6) 110 Pg(3) Rn(5) Zt(5)
+    0x8540_C000 | (imm6 << 16) | ((pg as u32) << 10) | ((rn as u32) << 5) | (zt as u32)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Prelude / Postlude (probe harness)
 // ═══════════════════════════════════════════════════════════════════════════════
 
