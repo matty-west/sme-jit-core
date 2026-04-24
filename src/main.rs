@@ -1108,6 +1108,137 @@ fn gate_21() {
     println!("✓ gate 21 complete\n");
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// Gate 21 Microbenchmark — Warmup + Percentiles + Dispatch Tax Isolation
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn gate21_bench() {
+    use crate::emitter::{build_sme_tiled_sgemm_page_cached, Activation};
+
+    println!("══════════════════════════════════════════════════════════════");
+    println!("  Gate 21 Microbenchmark — Where is Accelerate's Dispatch Tax?");
+    println!("══════════════════════════════════════════════════════════════");
+    println!();
+
+    let sizes: Vec<(usize, usize, usize)> = vec![
+        (16, 16, 16),
+        (16, 16, 32),
+        (32, 32, 16),
+        (32, 32, 32),
+        (48, 48, 48),
+        (64, 64, 64),
+        (96, 96, 96),
+        (128, 128, 128),
+    ];
+
+    let warmup = 500;
+    let iterations = 2000;
+
+    println!("  Warmup: {} iterations, Measured: {} iterations", warmup, iterations);
+    println!("  Reporting: min / median / max (ns per call)");
+    println!();
+    println!("  {:>12} | {:>22} | {:>22} | {:>7}",
+        "Size", "JIT (min/med/max)", "Accel (min/med/max)", "Speedup");
+    println!("  -------------|------------------------|------------------------|--------");
+
+    for (m, n, k) in &sizes {
+        let m = *m;
+        let n = *n;
+        let k = *k;
+
+        let a_row: Vec<f32> = (0..m * k).map(|i| ((i % 7) as f32) - 3.0).collect();
+        let b_row: Vec<f32> = (0..k * n).map(|i| ((i % 5) as f32) - 2.0).collect();
+
+        // Transpose A for JIT
+        let mut a_col = vec![0.0f32; m * k];
+        for i in 0..m {
+            for j in 0..k {
+                a_col[j * m + i] = a_row[i * k + j];
+            }
+        }
+        let mut c_jit = vec![0.0f32; m * n];
+        let mut c_accel = vec![0.0f32; m * n];
+
+        let page = build_sme_tiled_sgemm_page_cached(
+            m, n, k, Activation::None,
+            b_row.as_ptr() as u64, 0,
+        ).expect("page");
+
+        // ── Warmup both paths ──
+        for _ in 0..warmup {
+            unsafe {
+                page.call_with_args(a_col.as_ptr() as u64, c_jit.as_mut_ptr() as u64);
+            }
+        }
+        for _ in 0..warmup {
+            unsafe {
+                crate::crucible::cblas_sgemm(
+                    crate::crucible::CblasOrder::RowMajor,
+                    crate::crucible::CblasTranspose::NoTrans,
+                    crate::crucible::CblasTranspose::NoTrans,
+                    m as i32, n as i32, k as i32,
+                    1.0, a_row.as_ptr(), k as i32,
+                    b_row.as_ptr(), n as i32,
+                    0.0, c_accel.as_mut_ptr(), n as i32,
+                );
+            }
+        }
+
+        // ── Measure JIT per-iteration ──
+        let mut jit_times = Vec::with_capacity(iterations);
+        for _ in 0..iterations {
+            let start = std::time::Instant::now();
+            unsafe {
+                page.call_with_args(a_col.as_ptr() as u64, c_jit.as_mut_ptr() as u64);
+            }
+            jit_times.push(start.elapsed().as_nanos() as u64);
+        }
+
+        // ── Measure Accelerate per-iteration ──
+        let mut accel_times = Vec::with_capacity(iterations);
+        for _ in 0..iterations {
+            let start = std::time::Instant::now();
+            unsafe {
+                crate::crucible::cblas_sgemm(
+                    crate::crucible::CblasOrder::RowMajor,
+                    crate::crucible::CblasTranspose::NoTrans,
+                    crate::crucible::CblasTranspose::NoTrans,
+                    m as i32, n as i32, k as i32,
+                    1.0, a_row.as_ptr(), k as i32,
+                    b_row.as_ptr(), n as i32,
+                    0.0, c_accel.as_mut_ptr(), n as i32,
+                );
+            }
+            accel_times.push(start.elapsed().as_nanos() as u64);
+        }
+
+        // Sort for percentiles
+        jit_times.sort();
+        accel_times.sort();
+
+        let jit_min = jit_times[0];
+        let jit_med = jit_times[iterations / 2];
+        let jit_max = jit_times[iterations - 1];
+        let accel_min = accel_times[0];
+        let accel_med = accel_times[iterations / 2];
+        let accel_max = accel_times[iterations - 1];
+
+        let speedup = accel_med as f64 / jit_med as f64;
+
+        println!("  {:>3}×{:>3}×{:>3} | {:>5}/{:>6}/{:>6} ns | {:>5}/{:>6}/{:>6} ns | {:>5.1}×",
+            m, n, k,
+            jit_min, jit_med, jit_max,
+            accel_min, accel_med, accel_max,
+            speedup);
+    }
+
+    println!();
+    println!("  If Accelerate's median jumps sharply at a specific size,");
+    println!("  that's the dispatch tax threshold.");
+    println!();
+    println!("✓ gate 21 microbenchmark complete\n");
+}
+
 fn main() {
     install_sigill_handler();
     
@@ -1115,6 +1246,8 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.contains(&"sweep".to_string()) {
         gate_latency_sweep();
+    } else if args.contains(&"bench21".to_string()) {
+        gate21_bench();
     } else if args.contains(&"gate21".to_string()) {
         gate_21();
     } else if args.contains(&"gate20".to_string()) {
