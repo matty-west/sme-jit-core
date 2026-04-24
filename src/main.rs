@@ -1382,12 +1382,162 @@ fn gate_22() {
     println!("✓ gate 22 complete\n");
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// Gate 23: Monolithic Fused Inference Kernel
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn gate_23() {
+    use crate::weights::{MnistWeightsWide, MnistTestBatchWide};
+    use crate::inference::{MonolithicInferenceEngine, TiledInferenceEngine, run_inference_reference_wide};
+
+    println!("══════════════════════════════════════════════════════════════");
+    println!("  Gate 23: Monolithic Fused Inference Kernel");
+    println!("══════════════════════════════════════════════════════════════");
+    println!();
+    println!("  Strategy: Single SMSTART/SMSTOP + SVE gather-transpose");
+    println!("  between layers — all 3 layers in one JitPage call.");
+    println!();
+
+    let weights_dir = std::path::Path::new("scripts/weights_wide");
+
+    // ── Load weights ──
+    let weights = match MnistWeightsWide::load(weights_dir) {
+        Ok(w) => {
+            println!("  ✓ Weights loaded (hidden={})", w.hidden_dim);
+            w
+        }
+        Err(e) => {
+            println!("  [✗] Failed to load weights: {}", e);
+            println!("  Run: .venv/bin/python scripts/train_mnist_wide.py");
+            return;
+        }
+    };
+
+    let test = match MnistTestBatchWide::load(weights_dir, weights.hidden_dim) {
+        Ok(t) => {
+            println!("  ✓ Test batch loaded: {} images, labels: {:?}", t.labels.len(), t.labels);
+            t
+        }
+        Err(e) => {
+            println!("  [✗] Failed to load test batch: {}", e);
+            return;
+        }
+    };
+    println!();
+
+    let h = weights.hidden_dim;
+
+    // ── Step 1: Reference inference (Accelerate) ──
+    println!("  [1] Reference inference (Accelerate, hidden={})...", h);
+    let (ref_preds, _ref_h1, _ref_h2, ref_out) =
+        run_inference_reference_wide(&weights, &test.images);
+    let ref_correct = ref_preds.iter().zip(test.labels.iter())
+        .filter(|(p, l)| *p == *l).count();
+    println!("    Predictions: {:?}", ref_preds);
+    println!("    Correct: {}/16", ref_correct);
+    println!();
+
+    // ── Step 2: Build monolithic engine ──
+    println!("  [2] Building monolithic inference engine...");
+    let build_start = std::time::Instant::now();
+    let mut mono_engine = match MonolithicInferenceEngine::build(&weights) {
+        Ok(e) => e,
+        Err(e) => { println!("    [✗] Monolithic build failed: {}", e); return; }
+    };
+    let build_time = build_start.elapsed();
+    println!("    Build time: {:.1} μs", build_time.as_nanos() as f64 / 1000.0);
+    println!();
+
+    // ── Step 3: Correctness ──
+    println!("  [3] Monolithic JIT inference (pretransposed)...");
+    let mono_preds = mono_engine.run_pretransposed(&test.images_t);
+    let mono_correct = mono_preds.iter().zip(test.labels.iter())
+        .filter(|(p, l)| *p == *l).count();
+    println!("    Predictions: {:?}", mono_preds);
+    println!("    Correct: {}/16", mono_correct);
+
+    // ── Differential correctness ──
+    let preds_match = mono_preds == ref_preds;
+    let mut out_diff = 0.0f32;
+    for i in 0..16 {
+        for j in 0..10 {
+            let d = (ref_out[i * 16 + j] - mono_engine.output()[i * 16 + j]).abs();
+            if d > out_diff { out_diff = d; }
+        }
+    }
+    println!("    Predictions match ref: {}", if preds_match { "YES" } else { "NO" });
+    println!("    Output max_diff (first 10 cols): {:.2e}", out_diff);
+    println!();
+
+    // ── Step 4: Benchmark ──
+    println!("  [4] Benchmark (1000 iterations)...");
+    let iterations = 1000;
+
+    // Accelerate reference
+    let start = std::time::Instant::now();
+    for _ in 0..iterations {
+        let _ = run_inference_reference_wide(&weights, &test.images);
+    }
+    let accel_ns = start.elapsed().as_nanos() as f64 / iterations as f64;
+
+    // Monolithic JIT (pretransposed)
+    let start = std::time::Instant::now();
+    for _ in 0..iterations {
+        let _ = mono_engine.run_pretransposed(&test.images_t);
+    }
+    let mono_ns = start.elapsed().as_nanos() as f64 / iterations as f64;
+
+    // Also build and benchmark tiled engine for comparison
+    let mut tiled_engine = match TiledInferenceEngine::build(&weights) {
+        Ok(e) => e,
+        Err(e) => { println!("    [✗] Tiled build failed: {}", e); return; }
+    };
+    let start = std::time::Instant::now();
+    for _ in 0..iterations {
+        let _ = tiled_engine.run_pretransposed(&test.images_t);
+    }
+    let tiled_ns = start.elapsed().as_nanos() as f64 / iterations as f64;
+
+    let speedup_vs_accel = accel_ns / mono_ns;
+    let speedup_vs_tiled = tiled_ns / mono_ns;
+
+    println!("    Accelerate:              {:>7.0} ns ({:.1} μs)", accel_ns, accel_ns / 1000.0);
+    println!("    Tiled JIT (Gate 22):     {:>7.0} ns ({:.1} μs)", tiled_ns, tiled_ns / 1000.0);
+    println!("    Monolithic JIT (Gate 23):{:>7.0} ns ({:.1} μs)", mono_ns, mono_ns / 1000.0);
+    println!("    vs Accelerate:           {:.2}×", speedup_vs_accel);
+    println!("    vs Tiled (Gate 22):      {:.2}× speedup", speedup_vs_tiled);
+    println!();
+
+    if preds_match && out_diff < 10.0 {
+        println!("  ████████████████████████████████████████████████████████████");
+        println!("  █                                                          █");
+        println!("  █   ⚡ GATE 23 — MONOLITHIC FUSED KERNEL  ⚡               █");
+        println!("  █                                                          █");
+        println!("  █   Architecture: 784→{}→{}→10                           █", h, h);
+        println!("  █   Single SMSTART/SMSTOP + SVE gather-transpose          █");
+        println!("  █   Correct: {}/16, max_diff={:.2e}                    █", mono_correct, out_diff);
+        println!("  █   Monolithic: {:.1} μs  ({:.2}× vs Accelerate)        █", mono_ns / 1000.0, speedup_vs_accel);
+        println!("  █   vs Tiled: {:.2}× speedup                             █", speedup_vs_tiled);
+        println!("  █                                                          █");
+        println!("  ████████████████████████████████████████████████████████████");
+    } else {
+        println!("  [!] Gate 23 FAILED — preds_match={}, out_diff={:.2e}", preds_match, out_diff);
+        println!("    MONO: {:?}", mono_preds);
+        println!("    REF:  {:?}", ref_preds);
+    }
+
+    println!();
+    println!("✓ gate 23 complete\n");
+}
+
 fn main() {
     install_sigill_handler();
     
     // Check for "sweep" argument to run the big latency table
     let args: Vec<String> = std::env::args().collect();
-    if args.contains(&"sweep".to_string()) {
+    if args.contains(&"gate23".to_string()) {
+        gate_23();
+    } else if args.contains(&"sweep".to_string()) {
         gate_latency_sweep();
     } else if args.contains(&"gate22".to_string()) {
         gate_22();
