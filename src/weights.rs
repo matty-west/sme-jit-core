@@ -87,6 +87,8 @@ impl MnistWeights {
 pub struct MnistTestBatch {
     /// 16 images, each 784 floats (row-major: image[i] = data[i*784..(i+1)*784])
     pub images: Vec<f32>,
+    /// Pre-transposed images: 784×16 column-major (Gate 20 — zero-cost input)
+    pub images_t: Vec<f32>,
     /// 16 labels (ground-truth digits 0–9)
     pub labels: Vec<u8>,
     /// Reference logits from Python: 16×10 = 160 floats
@@ -106,6 +108,21 @@ impl MnistTestBatch {
         let ref_hidden1 = load_f32_bin(&weights_dir.join("test_hidden1.bin"))?;
         let ref_hidden2 = load_f32_bin(&weights_dir.join("test_hidden2.bin"))?;
 
+        // Load pre-transposed input (Gate 20). Fall back to runtime transpose if missing.
+        let images_t = match load_f32_bin(&weights_dir.join("test_images_t.bin")) {
+            Ok(t) if t.len() == 784 * 16 => t,
+            _ => {
+                // Runtime fallback: transpose images ourselves
+                let mut t = vec![0.0f32; 784 * 16];
+                for i in 0..16 {
+                    for k in 0..784 {
+                        t[k * 16 + i] = images[i * 784 + k];
+                    }
+                }
+                t
+            }
+        };
+
         if images.len() != 16 * 784 {
             return Err(format!("test_images: expected {} floats, got {}", 16 * 784, images.len()));
         }
@@ -122,6 +139,6 @@ impl MnistTestBatch {
             return Err(format!("test_hidden2: expected {} floats, got {}", 16 * 16, ref_hidden2.len()));
         }
 
-        Ok(Self { images, labels, ref_logits, ref_hidden1, ref_hidden2 })
+        Ok(Self { images, images_t, labels, ref_logits, ref_hidden1, ref_hidden2 })
     }
 }

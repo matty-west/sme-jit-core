@@ -246,6 +246,13 @@ def export_weights(W1, b1, W2, b2, W3, b3, X_test, y_test):
     save_f32(os.path.join(WEIGHTS_DIR, "test_images.bin"), test_images)
     save_u8(os.path.join(WEIGHTS_DIR, "test_labels.bin"), test_labels)
     
+    # Pre-transposed input for Gate 20: [784×16] column-major
+    # This eliminates the 12,544-element transpose at inference time.
+    # test_images is [16×784] row-major. Transpose to [784×16].
+    test_images_t = np.ascontiguousarray(test_images.T)  # (784, 16) row-major in memory
+    save_f32(os.path.join(WEIGHTS_DIR, "test_images_t.bin"), test_images_t)
+    print(f"  Exported test_images_t.bin: {test_images_t.shape} ({test_images_t.size} floats)")
+    
     # Compute reference logits for these 16 images
     z1 = test_images @ W1 + b1
     a1 = relu(z1)

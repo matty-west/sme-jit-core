@@ -828,6 +828,121 @@ fn gate_19() {
     println!("✓ gate 19 complete\n");
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// Gate 20: Pre-transposed Input — Eliminate 784×16 Transpose
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn gate_20() {
+    use crate::weights::{MnistWeights, MnistTestBatch};
+    use crate::inference::{CachedInferenceEngine, run_inference_reference};
+    use crate::crucible::Crucible;
+
+    println!("══════════════════════════════════════════════════════════════");
+    println!("  Gate 20: Pre-transposed Input — Zero-Cost Data Ingestion");
+    println!("══════════════════════════════════════════════════════════════");
+    println!();
+
+    let weights_dir = std::path::Path::new("scripts/weights");
+    let weights = match MnistWeights::load(weights_dir) {
+        Ok(w) => { println!("  ✓ Weights loaded"); w }
+        Err(e) => { println!("  [✗] {}", e); return; }
+    };
+    let test = match MnistTestBatch::load(weights_dir) {
+        Ok(t) => {
+            println!("  ✓ Test batch loaded (images_t: {} floats)", t.images_t.len());
+            t
+        }
+        Err(e) => { println!("  [✗] {}", e); return; }
+    };
+    println!();
+
+    // ── Build cached engine ──
+    let mut engine = match CachedInferenceEngine::build(&weights) {
+        Ok(e) => e,
+        Err(e) => { println!("  [✗] {}", e); return; }
+    };
+
+    // ── Correctness: pretransposed must match regular path ──
+    println!("  [1] Correctness check...");
+    let preds_regular = engine.run(&test.images);
+    let preds_pretrans = engine.run_pretransposed(&test.images_t);
+    let (ref_preds, ref_h1, ref_h2, ref_out) = run_inference_reference(&weights, &test.images);
+
+    println!("    Regular:       {:?}", preds_regular);
+    println!("    Pretransposed: {:?}", preds_pretrans);
+    println!("    Reference:     {:?}", ref_preds);
+
+    let preds_match = preds_pretrans == ref_preds;
+    let h1_diff = Crucible::max_abs_diff(&ref_h1, engine.hidden1());
+    let h2_diff = Crucible::max_abs_diff(&ref_h2, engine.hidden2());
+    let mut out_diff = 0.0f32;
+    for i in 0..16 {
+        for j in 0..10 {
+            let d = (ref_out[i * 16 + j] - engine.output()[i * 16 + j]).abs();
+            if d > out_diff { out_diff = d; }
+        }
+    }
+    let correct = preds_pretrans.iter().zip(test.labels.iter())
+        .filter(|(p, l)| *p == *l).count();
+
+    println!("    Correct: {}/16, match ref: {}", correct, if preds_match { "YES" } else { "NO" });
+    println!("    max_diff: h1={:.2e} h2={:.2e} out={:.2e}", h1_diff, h2_diff, out_diff);
+    println!();
+
+    // ── Benchmark: All paths ──
+    println!("  [2] Benchmark (1000 iterations)...");
+    let iterations = 1000;
+
+    // Accelerate
+    let start = std::time::Instant::now();
+    for _ in 0..iterations {
+        let _ = run_inference_reference(&weights, &test.images);
+    }
+    let accel_ns = start.elapsed().as_nanos() as f64 / iterations as f64;
+
+    // Cached JIT (with transpose)
+    let start = std::time::Instant::now();
+    for _ in 0..iterations {
+        let _ = engine.run(&test.images);
+    }
+    let cached_ns = start.elapsed().as_nanos() as f64 / iterations as f64;
+
+    // Cached JIT (pretransposed — no 784×16 transpose)
+    let start = std::time::Instant::now();
+    for _ in 0..iterations {
+        let _ = engine.run_pretransposed(&test.images_t);
+    }
+    let pretrans_ns = start.elapsed().as_nanos() as f64 / iterations as f64;
+
+    let speedup_pretrans = accel_ns / pretrans_ns;
+    let transpose_cost = cached_ns - pretrans_ns;
+
+    println!("    Accelerate:          {:.0} ns ({:.1} μs)", accel_ns, accel_ns / 1000.0);
+    println!("    Cached (transpose):  {:.0} ns ({:.1} μs)", cached_ns, cached_ns / 1000.0);
+    println!("    Cached (pretrans):   {:.0} ns ({:.1} μs)", pretrans_ns, pretrans_ns / 1000.0);
+    println!("    Transpose cost:      {:.0} ns ({:.1} μs)", transpose_cost, transpose_cost / 1000.0);
+    println!("    vs Accelerate:       {:.2}×", speedup_pretrans);
+    println!();
+
+    if preds_match && out_diff < 1.0 {
+        println!("  ████████████████████████████████████████████████████████████");
+        println!("  █                                                          █");
+        println!("  █   🚀 GATE 20 — PRE-TRANSPOSED INFERENCE  🚀             █");
+        println!("  █                                                          █");
+        println!("  █   Pretransposed: {:.1} μs/batch                        █", pretrans_ns / 1000.0);
+        println!("  █   vs Accelerate: {:.2}×                                █", speedup_pretrans);
+        println!("  █   Transpose saved: {:.1} μs                           █", transpose_cost / 1000.0);
+        println!("  █   Correctness: {}/16, max_diff={:.2e}               █", correct, out_diff);
+        println!("  █                                                          █");
+        println!("  ████████████████████████████████████████████████████████████");
+    } else {
+        println!("  [!] Gate 20 FAILED — correctness check did not pass.");
+    }
+
+    println!();
+    println!("✓ gate 20 complete\n");
+}
+
 fn main() {
     install_sigill_handler();
     
@@ -835,6 +950,8 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.contains(&"sweep".to_string()) {
         gate_latency_sweep();
+    } else if args.contains(&"gate20".to_string()) {
+        gate_20();
     } else if args.contains(&"gate19".to_string()) {
         gate_19();
     } else if args.contains(&"gate18".to_string()) {

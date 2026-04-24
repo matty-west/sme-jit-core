@@ -2,7 +2,7 @@
 
 ## Where We Are
 
-Gates 0–19 are complete. We have:
+Gates 0–20 are complete. We have:
 - A working JIT harness (MAP_JIT, fork isolation, GPR snapshots)
 - Proof that M4 uses ARM SME (not AMX)
 - A 16×16 SGEMM kernel (PTRUE → ZERO ZA → [LD1W×2 + FMOPA + ADD×2]×K → [ST1W + ADD×2]×16)
@@ -10,6 +10,7 @@ Gates 0–19 are complete. We have:
 - Differential correctness: `max_diff = 0.0` vs Accelerate
 - Benchmark: 1.8–2.5× faster than Accelerate at tile-sized problems
 - A 3-layer MNIST inference engine running entirely through JIT'd SME kernels (Gate 18)
+- **1.93× faster than Accelerate** for full 3-layer MLP inference with pre-transposed input (Gate 20)
 
 ## Gate 16: BFMOPA / SMOPA Probing (Complete - Negative Result)
 
@@ -162,6 +163,41 @@ per inference dominate the 6.8 μs. The FMOPA compute itself is ~3 μs.
 2. Emit column-major ST1W in kernel → eliminates inter-layer 16×16 transposes
 3. Single SMSTART/SMSTOP wrapping all 3 layers → eliminates 4 mode switches
 
+## Gate 20: Pre-transposed Input (Complete)
+
+**Goal**: Eliminate the 784×16 input transpose — the single biggest bottleneck in Gate 19.
+
+**Status**: Complete. **1.93× faster than Accelerate** for full 3-layer MLP inference.
+
+**Approach**:
+- Python exports `test_images_t.bin` — pre-transposed [784×16] column-major layout
+- `MnistTestBatch` loads `images_t` field (falls back to runtime transpose if file missing)
+- `CachedInferenceEngine::run_pretransposed()` skips the 784×16 transpose entirely
+- Hidden-layer 16×16 transposes remain (only 256 floats each — negligible)
+
+**Results**:
+
+| Path | Latency | vs Accelerate |
+|:-----|:--------|:-------------|
+| Accelerate (cblas_sgemm) | 3.8 μs | 1.00× |
+| Cached JIT (with transpose) | 9.1 μs | 0.42× |
+| **Cached JIT (pretransposed)** | **2.0 μs** | **1.93×** |
+
+The pre-transposed path saved **7.1 μs** — the transpose was 78% of total inference time.
+
+**Performance journey** (Gates 18 → 20):
+
+| Gate | Latency | vs Accelerate | Key optimization |
+|:-----|:--------|:-------------|:-----------------|
+| Gate 18 | 33.6 μs | 0.10× | Correctness proof |
+| Gate 19 | 6.8 μs | 0.46× | Cached JIT pages |
+| **Gate 20** | **2.0 μs** | **1.93×** | Pre-transposed input |
+
+**Remaining optimization headroom**:
+- Single SMSTART/SMSTOP across all 3 layers (saves ~0.5 μs from 4 mode switches)
+- Column-major inter-layer stores (eliminates two 16×16 transposes, saves ~0.1 μs)
+- These would push toward ~1.4 μs / ~2.7× vs Accelerate
+
 ## Deferred (from original roadmap)
 
 These items are deprioritized but not abandoned:
@@ -172,8 +208,8 @@ These items are deprioritized but not abandoned:
 | OS scheduler bypass (P-core pinning) | Gate 17 (old) | Deferred — nice for benchmarks, not critical path |
 | Double-buffered loads | Gate 18 (old) | Deferred — optimization after new instruction discovery |
 | Batched small-SGEMM | — | Deferred — build after fused kernels prove out |
-| Pre-transposed data layout | — | Next priority — eliminates 784×16 transpose |
-| Single SM session across layers | — | Next priority — eliminates 4 mode switches |
+| Single SM session across layers | — | Optional — would save ~0.5 μs |
+| Column-major inter-layer stores | — | Optional — would save ~0.1 μs |
 
 ## Non-Goals (Archived)
 
