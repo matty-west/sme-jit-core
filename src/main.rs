@@ -719,6 +719,115 @@ fn gate_18() {
     println!("✓ gate 18 complete\n");
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// Gate 19: Cached Inference Engine — Recover Speed Advantage
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn gate_19() {
+    use crate::weights::{MnistWeights, MnistTestBatch};
+    use crate::inference::{CachedInferenceEngine, run_inference_reference};
+    use crate::crucible::Crucible;
+
+    println!("══════════════════════════════════════════════════════════════");
+    println!("  Gate 19: Cached Inference Engine — Speed Recovery");
+    println!("══════════════════════════════════════════════════════════════");
+    println!();
+
+    let weights_dir = std::path::Path::new("scripts/weights");
+    let weights = match MnistWeights::load(weights_dir) {
+        Ok(w) => { println!("  ✓ Weights loaded"); w }
+        Err(e) => { println!("  [✗] {}", e); return; }
+    };
+    let test = match MnistTestBatch::load(weights_dir) {
+        Ok(t) => { println!("  ✓ Test batch loaded: labels {:?}", t.labels); t }
+        Err(e) => { println!("  [✗] {}", e); return; }
+    };
+    println!();
+
+    // ── Build cached engine (one-time cost) ──
+    println!("  [1] Building cached engine...");
+    let build_start = std::time::Instant::now();
+    let mut engine = match CachedInferenceEngine::build(&weights) {
+        Ok(e) => e,
+        Err(e) => { println!("    [✗] {}", e); return; }
+    };
+    let build_time = build_start.elapsed();
+    println!("    Build time: {:.1} μs (one-time cost)", build_time.as_nanos() as f64 / 1000.0);
+    println!();
+
+    // ── Correctness check ──
+    println!("  [2] Correctness check...");
+    let cached_preds = engine.run(&test.images);
+    let (ref_preds, ref_h1, ref_h2, ref_out) = run_inference_reference(&weights, &test.images);
+
+    println!("    Cached: {:?}", cached_preds);
+    println!("    Ref:    {:?}", ref_preds);
+
+    let h1_diff = Crucible::max_abs_diff(&ref_h1, engine.hidden1());
+    let h2_diff = Crucible::max_abs_diff(&ref_h2, engine.hidden2());
+    let mut out_diff = 0.0f32;
+    for i in 0..16 {
+        for j in 0..10 {
+            let d = (ref_out[i * 16 + j] - engine.output()[i * 16 + j]).abs();
+            if d > out_diff { out_diff = d; }
+        }
+    }
+
+    let correct = cached_preds.iter().zip(test.labels.iter())
+        .filter(|(p, l)| *p == *l).count();
+    let preds_match = cached_preds == ref_preds;
+
+    println!("    Correct: {}/16", correct);
+    println!("    Hidden1 max_diff: {:.2e}", h1_diff);
+    println!("    Hidden2 max_diff: {:.2e}", h2_diff);
+    println!("    Output  max_diff: {:.2e}", out_diff);
+    println!("    Predictions match ref: {}", if preds_match { "YES" } else { "NO" });
+    println!();
+
+    // ── Benchmark: Cached JIT vs Uncached JIT vs Accelerate ──
+    println!("  [3] Benchmark (1000 iterations)...");
+    let iterations = 1000;
+
+    // Accelerate
+    let start = std::time::Instant::now();
+    for _ in 0..iterations {
+        let _ = run_inference_reference(&weights, &test.images);
+    }
+    let accel_ns = start.elapsed().as_nanos() as f64 / iterations as f64;
+
+    // Cached JIT
+    let start = std::time::Instant::now();
+    for _ in 0..iterations {
+        let _ = engine.run(&test.images);
+    }
+    let cached_ns = start.elapsed().as_nanos() as f64 / iterations as f64;
+
+    let speedup_vs_accel = accel_ns / cached_ns;
+
+    println!("    Accelerate:   {:.0} ns/batch ({:.1} μs)", accel_ns, accel_ns / 1000.0);
+    println!("    Cached JIT:   {:.0} ns/batch ({:.1} μs)", cached_ns, cached_ns / 1000.0);
+    println!("    Speedup:      {:.2}×", speedup_vs_accel);
+    println!();
+
+    if preds_match && out_diff < 1.0 {
+        println!("  ████████████████████████████████████████████████████████████");
+        println!("  █                                                          █");
+        println!("  █   ⚡ GATE 19 — CACHED INFERENCE ENGINE  ⚡               █");
+        println!("  █                                                          █");
+        println!("  █   Build: {:.1} μs (one-time)                           █", build_time.as_nanos() as f64 / 1000.0);
+        println!("  █   Inference: {:.1} μs/batch                            █", cached_ns / 1000.0);
+        println!("  █   vs Accelerate: {:.2}×                                █", speedup_vs_accel);
+        println!("  █   Correctness: {}/16, max_diff={:.2e}               █", correct, out_diff);
+        println!("  █                                                          █");
+        println!("  ████████████████████████████████████████████████████████████");
+    } else {
+        println!("  [!] Gate 19 FAILED — correctness check did not pass.");
+    }
+
+    println!();
+    println!("✓ gate 19 complete\n");
+}
+
 fn main() {
     install_sigill_handler();
     
@@ -726,6 +835,8 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.contains(&"sweep".to_string()) {
         gate_latency_sweep();
+    } else if args.contains(&"gate19".to_string()) {
+        gate_19();
     } else if args.contains(&"gate18".to_string()) {
         gate_18();
     } else {

@@ -603,6 +603,75 @@ pub fn build_sme_sgemm_page(
     Some(page)
 }
 
+/// Build a **cached** JIT page for the SME SGEMM kernel.
+///
+/// Unlike `build_sme_sgemm_page`, this version takes A (input) and C (output)
+/// pointers at **call time** via X0 and X1 (AArch64 calling convention).
+/// Immutable pointers (B weights, bias) are baked into the instruction stream.
+///
+/// This means the page can be built once and called repeatedly with different
+/// input/output buffers — no mmap/munmap per inference call.
+///
+/// Calling convention:
+/// - `X0` = A pointer (input, column-major for FMOPA)
+/// - `X1` = C pointer (output, row-major)
+///
+/// Baked into the page:
+/// - `X5` = B pointer (weights, row-major)
+/// - `X6` = Bias pointer (if activation uses bias)
+///
+/// The page moves X0→X4 (A) and X1→X2 (C), then runs the same kernel.
+pub fn build_sme_sgemm_page_cached(
+    k: usize,
+    act: Activation,
+    b_ptr: u64,
+    bias_ptr: u64,
+) -> Option<crate::jit_page::JitPage> {
+    let kernel = build_sme_sgemm_16x16(k, act);
+
+    let mut insns = Vec::with_capacity(20 + kernel.len() + 3);
+    
+    // Move call arguments into kernel registers:
+    // MOV X4, X0  (A input)
+    // MOV X2, X1  (C output)
+    insns.push(encode_mov_x(4, 0));  // X4 = X0 (A)
+    insns.push(encode_mov_x(2, 1));  // X2 = X1 (C)
+    insns.push(encode_mov_xzr(3));   // X3 = 0
+    insns.push(encode_mov_xzr(12));  // X12 = 0
+    
+    // Bake immutable pointers
+    insns.extend(emit_load_imm64_vec(5, b_ptr));    // X5 = B (weights)
+    if act == Activation::Bias || act == Activation::BiasReLU {
+        insns.extend(emit_load_imm64_vec(6, bias_ptr)); // X6 = Bias
+    }
+
+    insns.push(SMSTART);
+    insns.extend_from_slice(&kernel);
+    insns.push(SMSTOP);
+    insns.push(RET);
+
+    let total_bytes = insns.len() * 4;
+    let page_size = ((total_bytes + 16383) / 16384) * 16384;
+
+    let page = crate::jit_page::JitPage::alloc(page_size).ok()?;
+    page.make_writable();
+
+    let mut off = 0;
+    for &op in &insns {
+        page.write_instruction(off, op);
+        off += 4;
+    }
+
+    page.make_executable();
+    Some(page)
+}
+
+/// Encode `MOV Xd, Xn` (alias of ORR Xd, XZR, Xn).
+pub const fn encode_mov_x(rd: u8, rn: u8) -> u32 {
+    // ORR Xd, XZR, Xn → 0xAA000000 | (Xn << 16) | (XZR << 5) | Xd
+    0xAA00_0000 | ((rn as u32) << 16) | (31 << 5) | (rd as u32)
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Prelude / Postlude (probe harness)
 // ═══════════════════════════════════════════════════════════════════════════════

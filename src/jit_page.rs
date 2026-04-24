@@ -247,6 +247,24 @@ impl JitPage {
             f()
         }
     }
+
+    /// Call the JIT buffer as `extern "C" fn(u64, u64)`.
+    ///
+    /// Passes two arguments via X0 and X1 (AArch64 calling convention).
+    /// Used by cached kernels where immutable pointers (weights, bias) are
+    /// baked in, but mutable pointers (A input, C output) change per call.
+    ///
+    /// # Safety
+    /// Same requirements as [`Self::call_void`], plus the caller must ensure
+    /// that `arg0` and `arg1` are valid pointers the kernel will dereference.
+    pub unsafe fn call_with_args(&self, arg0: u64, arg1: u64) {
+        // SAFETY: The caller guarantees the page is executable, contains valid
+        // instructions, and that arg0/arg1 are valid for the kernel's access pattern.
+        unsafe {
+            let f: extern "C" fn(u64, u64) = core::mem::transmute(self.ptr);
+            f(arg0, arg1);
+        }
+    }
 }
 
 impl Drop for JitPage {

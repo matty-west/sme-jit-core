@@ -2,7 +2,7 @@
 
 ## Where We Are
 
-Gates 0–18 are complete. We have:
+Gates 0–19 are complete. We have:
 - A working JIT harness (MAP_JIT, fork isolation, GPR snapshots)
 - Proof that M4 uses ARM SME (not AMX)
 - A 16×16 SGEMM kernel (PTRUE → ZERO ZA → [LD1W×2 + FMOPA + ADD×2]×K → [ST1W + ADD×2]×16)
@@ -126,6 +126,42 @@ between rectangular matmul (784→16) and square tile (16×16).
 - K = number of FMOPA outer products = inner dimension of the matmul
 - For 784→16: K=784, not K=49 (each FMOPA is one rank-1 update, not a 16-wide panel)
 
+## Gate 19: Cached Inference Engine (Complete)
+
+**Goal**: Eliminate per-call JIT page construction overhead to recover speed advantage.
+
+**Status**: Complete. Correctness verified, 5× faster than uncached Gate 18.
+
+**Architecture**:
+- `CachedInferenceEngine` — builds 3 JIT pages once at construction time
+- `build_sme_sgemm_page_cached()` — bakes immutable pointers (weights, bias), takes A/C via X0/X1
+- `call_with_args(a_ptr, c_ptr)` — new JitPage method for register-based calling convention
+- Pre-allocated buffers reused across calls (zero heap allocation per inference)
+
+**Calling convention** (cached kernels):
+- `X0` = A pointer (input, column-major) — passed at call time
+- `X1` = C pointer (output, row-major) — passed at call time
+- `X5` = B pointer (weights) — baked into instruction stream
+- `X6` = Bias pointer — baked into instruction stream
+- Kernel does: `MOV X4,X0; MOV X2,X1` then runs standard FMOPA pipeline
+
+**Results**:
+
+| Metric | Gate 18 (uncached) | Gate 19 (cached) |
+|:-------|:-------------------|:-----------------|
+| Build time | ~15 μs/call × 3 | 32.5 μs one-time |
+| Inference latency | 33.6 μs/batch | 6.8 μs/batch |
+| vs Accelerate | 0.10× | 0.46× |
+| Correctness | 16/16, 0.00e0 | 16/16, 0.00e0 |
+
+**Remaining bottleneck**: The input transpose (784×16 = 12,544 scalar copies) and 3× SMSTART/SMSTOP
+per inference dominate the 6.8 μs. The FMOPA compute itself is ~3 μs.
+
+**Next optimization opportunities** (for a future gate):
+1. Pre-transpose input on the Python/data side → eliminates 784×16 transpose
+2. Emit column-major ST1W in kernel → eliminates inter-layer 16×16 transposes
+3. Single SMSTART/SMSTOP wrapping all 3 layers → eliminates 4 mode switches
+
 ## Deferred (from original roadmap)
 
 These items are deprioritized but not abandoned:
@@ -136,6 +172,8 @@ These items are deprioritized but not abandoned:
 | OS scheduler bypass (P-core pinning) | Gate 17 (old) | Deferred — nice for benchmarks, not critical path |
 | Double-buffered loads | Gate 18 (old) | Deferred — optimization after new instruction discovery |
 | Batched small-SGEMM | — | Deferred — build after fused kernels prove out |
+| Pre-transposed data layout | — | Next priority — eliminates 784×16 transpose |
+| Single SM session across layers | — | Next priority — eliminates 4 mode switches |
 
 ## Non-Goals (Archived)
 

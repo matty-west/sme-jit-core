@@ -8,165 +8,149 @@
 //!
 //! Batch=16: all three layers operate on full 16×16 ZA tiles.
 
-use crate::emitter::{build_sme_sgemm_page, Activation};
+use crate::emitter::{build_sme_sgemm_page, build_sme_sgemm_page_cached, Activation};
 use crate::jit_page::JitPage;
 use crate::weights::MnistWeights;
 
-/// A pre-compiled 3-layer MLP inference engine.
+/// A **cached** 3-layer MLP inference engine (Gate 19).
 ///
-/// Each layer is a single JIT page callable via `page.call_void()`.
-/// Pointers to weights, biases, and intermediate buffers are baked
-/// into the machine code at construction time.
-pub struct InferenceEngine {
-    /// Layer 1: input[16×784] × W1[784×16] + b1 → ReLU → hidden1[16×16]
-    _page1: JitPage,
-    /// Layer 2: hidden1[16×16] × W2[16×16] + b2 → ReLU → hidden2[16×16]
-    _page2: JitPage,
-    /// Layer 3: hidden2[16×16] × W3[16×16] + b3 → logits[16×16]
-    _page3: JitPage,
+/// JIT pages are compiled once at construction time. Per-inference calls
+/// pass only the input/output pointers — no mmap, no munmap, no icache flush.
+///
+/// Buffers are pre-allocated and reused across calls.
+pub struct CachedInferenceEngine {
+    /// Layer 1: input_t[784×16] × W1[784×16] + b1 → ReLU → hidden1[16×16]
+    page1: JitPage,
+    /// Layer 2: hidden1_t[16×16] × W2[16×16] + b2 → ReLU → hidden2[16×16]
+    page2: JitPage,
+    /// Layer 3: hidden2_t[16×16] × W3[16×16] + b3 → output[16×16]
+    page3: JitPage,
 
-    /// Input buffer: 16 images × 784 features = 12544 floats.
-    /// Must be written before calling `run()`.
-    input_buf: Vec<f32>,
-
-    /// Intermediate buffer after layer 1: 16×16 = 256 floats.
-    hidden1_buf: Vec<f32>,
-
-    /// Intermediate buffer after layer 2: 16×16 = 256 floats.
-    hidden2_buf: Vec<f32>,
-
-    /// Output buffer: 16×16 = 256 floats (only first 10 cols are logits).
-    output_buf: Vec<f32>,
+    /// Pre-allocated transpose buffer for input: 784×16
+    input_t: Vec<f32>,
+    /// Pre-allocated output from layer 1: 16×16
+    hidden1: Vec<f32>,
+    /// Pre-allocated transposed hidden1: 16×16
+    hidden1_t: Vec<f32>,
+    /// Pre-allocated output from layer 2: 16×16
+    hidden2: Vec<f32>,
+    /// Pre-allocated transposed hidden2: 16×16
+    hidden2_t: Vec<f32>,
+    /// Pre-allocated output: 16×16
+    output: Vec<f32>,
 }
 
-impl InferenceEngine {
-    /// Build the inference engine by JIT-compiling all three layers.
+impl CachedInferenceEngine {
+    /// Build the cached inference engine. JIT pages are compiled once here.
     ///
-    /// The `weights` struct must outlive the engine (weights are referenced
-    /// by pointer from the JIT pages). In practice we keep them alive in
-    /// the same scope.
+    /// The `weights` struct must outlive the engine (weight pointers are
+    /// baked into the JIT pages).
     pub fn build(weights: &MnistWeights) -> Result<Self, String> {
-        // Allocate intermediate buffers
-        let input_buf = vec![0.0f32; 16 * 784];
-        let mut hidden1_buf = vec![0.0f32; 16 * 16];
-        let mut hidden2_buf = vec![0.0f32; 16 * 16];
-        let mut output_buf = vec![0.0f32; 16 * 16];
+        // Build cached pages — B (weights) and bias are baked in,
+        // A (input) and C (output) are passed via X0/X1 at call time.
+        let page1 = build_sme_sgemm_page_cached(
+            784, Activation::BiasReLU,
+            weights.w1.as_ptr() as u64,
+            weights.b1.as_ptr() as u64,
+        ).ok_or("Failed to build cached Layer 1 page")?;
 
-        // Layer 1: 16×784 × 784×16, K=49
-        // Input A = input_buf (16 images, 784 features each, stored row-major)
-        //   The kernel loads A as K panels of 16 floats. With row-major [16×784],
-        //   panel k reads input_buf[k*16..(k+1)*16] across the batch dimension.
-        //   But wait — our kernel loads A[k] from X4+k*64. For a 16×784 input,
-        //   we need the kernel to iterate over 784/16 = 49 chunks of the input.
-        //
-        //   FMOPA computes ZA += Z0 ⊗ Z1 (outer product).
-        //   Z0 comes from A (input), Z1 comes from B (weights).
-        //   After K iterations: ZA[i][j] = Σ_k A_panel[k][i] × B_panel[k][j]
-        //
-        //   For correct matmul C = Input × Weights:
-        //   - A_panel[k][i] should be Input[i][k] (the k-th feature of image i)
-        //   - B_panel[k][j] should be Weights[k][j] (the k-th row of weights)
-        //
-        //   Input is [16×784] row-major, so Input[i][k] is at offset i*784+k.
-        //   But the kernel loads 16 contiguous floats per panel.
-        //   We need Input transposed to [784×16] so panel k = Input_T[k*16..(k+1)*16]
-        //   gives us [Input[0][k], Input[1][k], ..., Input[15][k]].
-        //
-        //   So: A pointer = transposed input buffer (784×16)
-        //       B pointer = W1 (784×16, already row-major)
-        //
-        //   We'll transpose the input at runtime (cheap: just a memory shuffle).
-        //   Actually, let's pre-allocate a transpose buffer.
+        let page2 = build_sme_sgemm_page_cached(
+            16, Activation::BiasReLU,
+            weights.w2.as_ptr() as u64,
+            weights.b2.as_ptr() as u64,
+        ).ok_or("Failed to build cached Layer 2 page")?;
 
-        let input_t_buf = vec![0.0f32; 784 * 16]; // Will be filled at runtime
-
-        let page1 = build_sme_sgemm_page(
-            49, // K = 784/16
-            Activation::BiasReLU,
-            input_t_buf.as_ptr() as u64,     // A = transposed input
-            weights.w1.as_ptr() as u64,       // B = W1
-            hidden1_buf.as_mut_ptr() as u64,  // C = hidden1
-            weights.b1.as_ptr() as u64,       // bias
-        )
-        .ok_or("Failed to build Layer 1 JIT page")?;
-
-        // Layer 2: 16×16 × 16×16, K=1
-        // hidden1 is already [16×16] row-major.
-        // For FMOPA: A_panel[0] = column 0 of hidden1 across all 16 rows.
-        // hidden1[i][0] is at offset i*16. Contiguous stride=16, not 1.
-        // So we need hidden1 transposed too... OR we use K=1 where:
-        //   Z0 = 16 floats from hidden1 starting at offset 0 (first 16 floats = row 0)
-        //   Z1 = 16 floats from W2 starting at offset 0 (first 16 floats = row 0)
-        //   ZA += Z0 ⊗ Z1 → ZA[i][j] = hidden1[0][i] × W2[0][j]
-        //
-        // That's wrong — it only uses row 0. For K=1 with 16×16:
-        //   We need K=16, loading one row at a time!
-        //   Wait, let me re-examine the kernel...
-        //
-        // The kernel does:
-        //   for k in 0..K:
-        //     Z0 = LD1W from A + k*64
-        //     Z1 = LD1W from B + k*64
-        //     ZA += Z0 ⊗ Z1
-        //
-        // For C = A × B where A is [16×16] and B is [16×16]:
-        //   ZA[i][j] = Σ_k Z0_k[i] × Z1_k[j]
-        //
-        // With K=16 and stride 64 (16 floats):
-        //   Z0_k = A[k*16..(k+1)*16] → row k of a [16×16] matrix stored row-major
-        //     But Z0_k[i] should be A[i][k] (column k), not A[k][i] (row k).
-        //
-        // So for [16×16] × [16×16], we need:
-        //   A stored as [16×16] COLUMN-major (or transposed row-major)
-        //   B stored as [16×16] ROW-major (already correct)
-        //   K = 16
-        //
-        // hidden1 is output from layer 1 as row-major [16×16].
-        // We need it transposed for layer 2's input.
-        //
-        // Same issue for layer 3: hidden2 needs transposing.
-        //
-        // Solution: Transpose each intermediate buffer before the next layer.
-        // For 16×16, transpose is trivial (256 float swaps, ~1 cache line).
-
-        let hidden1_t_buf = vec![0.0f32; 16 * 16]; // transposed hidden1
-
-        let page2 = build_sme_sgemm_page(
-            16, // K = 16 (full 16×16 matmul)
-            Activation::BiasReLU,
-            hidden1_t_buf.as_ptr() as u64,    // A = transposed hidden1
-            weights.w2.as_ptr() as u64,        // B = W2
-            hidden2_buf.as_mut_ptr() as u64,   // C = hidden2
-            weights.b2.as_ptr() as u64,        // bias
-        )
-        .ok_or("Failed to build Layer 2 JIT page")?;
-
-        let hidden2_t_buf = vec![0.0f32; 16 * 16]; // transposed hidden2
-
-        // Layer 3: 16×16 × 16×16 (padded), K=16, no ReLU (just bias)
-        let page3 = build_sme_sgemm_page(
-            16,
-            Activation::Bias,
-            hidden2_t_buf.as_ptr() as u64,     // A = transposed hidden2
-            weights.w3.as_ptr() as u64,         // B = W3 (zero-padded to 16×16)
-            output_buf.as_mut_ptr() as u64,     // C = output
-            weights.b3.as_ptr() as u64,         // bias (zero-padded)
-        )
-        .ok_or("Failed to build Layer 3 JIT page")?;
+        let page3 = build_sme_sgemm_page_cached(
+            16, Activation::Bias,
+            weights.w3.as_ptr() as u64,
+            weights.b3.as_ptr() as u64,
+        ).ok_or("Failed to build cached Layer 3 page")?;
 
         Ok(Self {
-            _page1: page1,
-            _page2: page2,
-            _page3: page3,
-            input_buf,
-            hidden1_buf,
-            hidden2_buf,
-            output_buf,
+            page1, page2, page3,
+            input_t: vec![0.0f32; 784 * 16],
+            hidden1: vec![0.0f32; 256],
+            hidden1_t: vec![0.0f32; 256],
+            hidden2: vec![0.0f32; 256],
+            hidden2_t: vec![0.0f32; 256],
+            output: vec![0.0f32; 256],
         })
     }
 
-    /// Get the number of layers.
-    pub fn num_layers(&self) -> usize { 3 }
+    /// Run inference on a batch of 16 images.
+    ///
+    /// This is the **performance path** — no allocations, no page rebuilds.
+    /// Only the transpose + 3 kernel calls + argmax.
+    ///
+    /// Returns: predictions[16]
+    pub fn run(&mut self, images: &[f32]) -> Vec<u8> {
+        assert_eq!(images.len(), 16 * 784, "Expected 16×784 input");
+
+        // ── Transpose input: [16×784] row-major → [784×16] column-major ──
+        for i in 0..16 {
+            for k in 0..784 {
+                self.input_t[k * 16 + i] = images[i * 784 + k];
+            }
+        }
+
+        // ── Layer 1: call_with_args(A=input_t, C=hidden1) ──
+        // SAFETY: page1 is a valid cached kernel, input_t and hidden1 are valid buffers.
+        unsafe {
+            self.page1.call_with_args(
+                self.input_t.as_ptr() as u64,
+                self.hidden1.as_mut_ptr() as u64,
+            );
+        }
+
+        // ── Transpose hidden1 ──
+        for i in 0..16 {
+            for j in 0..16 {
+                self.hidden1_t[j * 16 + i] = self.hidden1[i * 16 + j];
+            }
+        }
+
+        // ── Layer 2: call_with_args(A=hidden1_t, C=hidden2) ──
+        unsafe {
+            self.page2.call_with_args(
+                self.hidden1_t.as_ptr() as u64,
+                self.hidden2.as_mut_ptr() as u64,
+            );
+        }
+
+        // ── Transpose hidden2 ──
+        for i in 0..16 {
+            for j in 0..16 {
+                self.hidden2_t[j * 16 + i] = self.hidden2[i * 16 + j];
+            }
+        }
+
+        // ── Layer 3: call_with_args(A=hidden2_t, C=output) ──
+        unsafe {
+            self.page3.call_with_args(
+                self.hidden2_t.as_ptr() as u64,
+                self.output.as_mut_ptr() as u64,
+            );
+        }
+
+        // ── Argmax over first 10 columns ──
+        let mut predictions = Vec::with_capacity(16);
+        for i in 0..16 {
+            let row = &self.output[i * 16..i * 16 + 10];
+            let pred = row.iter().enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .map(|(idx, _)| idx as u8)
+                .unwrap_or(0);
+            predictions.push(pred);
+        }
+        predictions
+    }
+
+    /// Get the output buffer (16×16, first 10 cols are logits).
+    pub fn output(&self) -> &[f32] { &self.output }
+    /// Get the hidden1 buffer (16×16).
+    pub fn hidden1(&self) -> &[f32] { &self.hidden1 }
+    /// Get the hidden2 buffer (16×16).
+    pub fn hidden2(&self) -> &[f32] { &self.hidden2 }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
