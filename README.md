@@ -10,7 +10,7 @@
 
 # sme-jit-core
 
-**A zero-overhead Rust JIT harness for reverse-engineering and executing matrix coprocessor instructions on Apple Silicon M4 — beats Accelerate.framework by 5× at tile-sized problems, runs a full MNIST classifier 1.13× faster than Accelerate with 48-wide hidden layers.**
+**A zero-overhead Rust JIT harness for reverse-engineering and executing matrix coprocessor instructions on Apple Silicon M4 — beats Accelerate.framework by 5× at tile-sized problems, runs a full MNIST classifier 1.55× faster than Accelerate with a monolithic fused kernel.**
 
 Empirical opcode probing, fault-tolerant sandboxing, and raw SME instruction emission straight to the silicon.
 
@@ -32,16 +32,24 @@ Two execution modes: a **fork-isolated probe harness** for safely exploring undo
 
 **JIT dominates at ≤48×48** (zero dispatch overhead — Accelerate pays ~200ns fixed tax per call). Accelerate wins at ≥64×64 (optimized cache blocking, multi-core). The crossover at ~48×48 defines our niche: **tiny-model, latency-critical inference**.
 
-### Full MNIST Inference — 3-Layer MLP (784→16→16→10)
+### Full MNIST Inference — 3-Layer MLP
 
 ```
-  Path                          Latency       vs Accelerate
-  Accelerate (cblas_sgemm)      3.8 μs        1.00×
-  Cached JIT (with transpose)   9.1 μs        0.42×
-  Cached JIT (pretransposed)    2.0 μs        1.93×
+  784→48→48→10 (Gate 23 — Monolithic Fused Kernel)
+  ─────────────────────────────────────────────────
+  Accelerate (cblas_sgemm)          4.6 μs        1.00×
+  Tiled JIT (Gate 22)               4.6 μs        1.00×
+  Monolithic JIT (Gate 23)          3.0 μs        1.55×
+
+  784→16→16→10 (Gate 20 — Cached Kernel)
+  ──────────────────────────────────────
+  Accelerate (cblas_sgemm)          3.8 μs        1.00×
+  Cached JIT (pretransposed)        2.0 μs        1.93×
 ```
 
-16/16 images classified correctly. Bit-exact match vs Accelerate reference (`max_diff = 0.00e0`). Zero frameworks, zero dispatch, pure silicon.
+16/16 images classified correctly in both architectures. Bit-exact match vs Accelerate reference (`max_diff = 0.00e0`). Zero frameworks, zero dispatch, pure silicon.
+
+**Gate 23 innovations**: Single SMSTART/SMSTOP wrapping all 3 layers, ST1W vertical slices for zero-transpose column-major inter-layer stores, LD1RW broadcast bias for column-major activation.
 
 **Differential correctness:** `max_diff = 0.0` vs `cblas_sgemm` across all tested configurations. Every result is bit-identical to Apple's reference implementation.
 
@@ -63,9 +71,10 @@ These parameters were discovered through empirical instruction probing — not f
 2. **Discovers** — Proved M4 uses ARM SME through empirical instruction probing when Apple's own documentation remained silent
 3. **Computes** — JIT-emits SME instruction sequences (LD1W → FMOPA → ST1W) producing correct SGEMM results, with fused activation (ReLU, Bias)
 4. **Tiles** — Emits tiled GEMM kernels for arbitrary M×N (multiples of 16) up to 128×128 with branched K-loops
-5. **Infers** — Runs a full 3-layer MNIST MLP entirely through JIT'd fused SME kernels, 1.93× faster than Accelerate
-6. **Verifies** — Differential correctness via Crucible: `max_diff = 0.0` vs `cblas_sgemm`
-7. **Benchmarks** — Rigorous microbenchmarks with warmup, percentile timing, and per-iteration measurement
+5. **Infers** — Runs a full 3-layer MNIST MLP entirely through JIT'd fused SME kernels, 1.55× faster than Accelerate (48-wide), 1.93× (16-wide)
+6. **Fuses** — Monolithic kernel: all 3 layers in one JitPage, one SMSTART/SMSTOP, vertical ST1W for zero-transpose inter-layer stores
+7. **Verifies** — Differential correctness via Crucible: `max_diff = 0.0` vs `cblas_sgemm`
+8. **Benchmarks** — Rigorous microbenchmarks with warmup, percentile timing, and per-iteration measurement
 
 ## Milestones
 
@@ -84,6 +93,7 @@ These parameters were discovered through empirical instruction probing — not f
 | 20 | Pre-transposed input — **1.93× faster than Accelerate** | ✅ |
 | 21 | **Tiled GEMM — arbitrary M×N up to 128×128, 5× at 16×16** | ✅ |
 | 22 | **Tiled inference — 784→48→48→10 MLP, 1.13× vs Accelerate** | ✅ |
+| 23 | **Monolithic fused kernel — 1.55× vs Accelerate, 3.0 μs/batch** | ✅ |
 
 See [ROADMAP.md](ROADMAP.md) for detailed findings and architecture notes.
 
@@ -118,6 +128,7 @@ benches/
 cargo run --release
 
 # Run specific gates
+cargo run --release -- gate23     # Monolithic fused inference (784→48→48→10, 1.55×)
 cargo run --release -- gate22     # Tiled inference (784→48→48→10)
 cargo run --release -- gate21     # Tiled GEMM correctness + benchmark
 cargo run --release -- gate20     # Pre-transposed inference (784→16→16→10)
