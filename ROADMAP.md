@@ -2,7 +2,7 @@
 
 ## Where We Are
 
-Gates 0–21 are complete. We have:
+Gates 0–22 are complete. We have:
 - A working JIT harness (MAP_JIT, fork isolation, GPR snapshots)
 - Proof that M4 uses ARM SME (not AMX)
 - A 16×16 SGEMM kernel (PTRUE → ZERO ZA → [LD1W×2 + FMOPA + ADD×2]×K → [ST1W + ADD×2]×16)
@@ -12,6 +12,7 @@ Gates 0–21 are complete. We have:
 - A 3-layer MNIST inference engine running entirely through JIT'd SME kernels (Gate 18)
 - **1.93× faster than Accelerate** for full 3-layer MLP inference with pre-transposed input (Gate 20)
 - Tiled GEMM up to 128×128 with branched K-loop, **5× faster at 16×16** (Gate 21)
+- **Tiled inference engine**: 784→48→48→10 MLP using tiled GEMM, **1.13× vs Accelerate** (Gate 22)
 
 ## Gate 16: BFMOPA / SMOPA Probing (Complete - Negative Result)
 
@@ -232,20 +233,52 @@ The pre-transposed path saved **7.1 μs** — the transpose was 78% of total inf
 
 **Not yet implemented**: Edge tiles (non-16-multiple dimensions), L2 cache blocking, double buffering.
 
-## Gate 22: Tiled Inference Engine (Next)
+## Gate 22: Tiled Inference Engine (Complete)
 
 **Goal**: Replace the 16×16-only `CachedInferenceEngine` with the tiled GEMM infrastructure from Gate 21 — enable wider hidden layers and bigger models.
 
-**Why**: Gate 20's MNIST engine is locked to 16-wide hidden layers (one ZA tile). Real models need 64, 128, 256+ hidden dimensions. Gate 21 proved tiled GEMM works up to 128×128. Now wire it into the inference engine.
+**Status**: Complete. 16/16 correct, `max_diff = 0.00e0`, **1.13× faster than Accelerate**.
 
-**Build plan**:
-1. Retrain MNIST with wider layers: 784→64→64→10 (or 784→128→64→10)
-2. Update `CachedInferenceEngine` to use `build_sme_tiled_sgemm_page_cached` for all layers
-3. Correctness: differential test vs Accelerate reference (same as Gate 18)
-4. Benchmark: compare tiled JIT inference vs Accelerate at wider hidden dims
-5. Find the model-size sweet spot where JIT still beats Accelerate end-to-end
+**Architecture**: 784 → 48 (BiasReLU) → 48 (BiasReLU) → 10 (Bias, padded to 16)
 
-**Expected outcome**: JIT should still win at 64-wide hidden layers (48×48 crossover) but lose at 128-wide. This tells us exactly how big a model we can run faster than Apple.
+Hidden dim 48 was chosen as the sweet spot — the largest dimension where tiled GEMM still beats Accelerate (1.4× at 48×48×48 per Gate 21 benchmarks). 48 = 3×16 tiles, so tiling logic gets a real workout.
+
+**Components**:
+- `scripts/train_mnist_wide.py` — trains 784→48→48→10 MLP, exports to `scripts/weights_wide/`
+- `MnistWeightsWide` — parameterized weight loader with `config.txt` for hidden dim
+- `TiledInferenceEngine` — uses `build_sme_tiled_sgemm_page_cached` for all layers
+- `run_inference_reference_wide()` — Accelerate reference for differential testing
+
+**Layer dimensions** (batch=16):
+
+| Layer | M | N | K | Tiles | Activation |
+|:------|:--|:--|:--|:------|:-----------|
+| 1 | 16 | 48 | 784 | 1×3 | BiasReLU |
+| 2 | 16 | 48 | 48 | 1×3 | BiasReLU |
+| 3 | 16 | 16 | 48 | 1×1 | Bias |
+
+**Results**:
+
+| Metric | Value |
+|:-------|:------|
+| Predictions correct | 16/16 |
+| Output max_diff | 0.00e0 |
+| Build time (one-time) | 21.3 μs |
+| Accelerate latency | 5.1 μs/batch |
+| **Tiled JIT (pretransposed)** | **4.5 μs/batch** |
+| Tiled JIT (with transpose) | 11.2 μs/batch |
+| **vs Accelerate** | **1.13×** |
+
+**Performance journey** (Gates 18 → 22):
+
+| Gate | Architecture | Latency | vs Accelerate | Key optimization |
+|:-----|:------------|:--------|:-------------|:-----------------|
+| Gate 18 | 784→16→16→10 | 33.6 μs | 0.10× | Correctness proof |
+| Gate 19 | 784→16→16→10 | 6.8 μs | 0.46× | Cached JIT pages |
+| Gate 20 | 784→16→16→10 | 2.0 μs | 1.93× | Pre-transposed input |
+| **Gate 22** | **784→48→48→10** | **4.5 μs** | **1.13×** | Tiled GEMM, wider model |
+
+**Key insight**: Wider hidden layers (48 vs 16) push each layer's GEMM closer to the 48×48 crossover point where JIT and Accelerate are nearly matched. The JIT still wins overall due to zero dispatch overhead, but the margin narrows from 1.93× to 1.13×. This confirms the sweet spot: **models with hidden dims ≤48 benefit from JIT; larger models should use Accelerate**.
 
 ## Gate 23: Single Streaming Session (Optimization)
 

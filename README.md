@@ -10,7 +10,7 @@
 
 # sme-jit-core
 
-**A zero-overhead Rust JIT harness for reverse-engineering and executing matrix coprocessor instructions on Apple Silicon M4 — beats Accelerate.framework by 5× at tile-sized problems, runs a full MNIST classifier 1.93× faster than Accelerate.**
+**A zero-overhead Rust JIT harness for reverse-engineering and executing matrix coprocessor instructions on Apple Silicon M4 — beats Accelerate.framework by 5× at tile-sized problems, runs a full MNIST classifier 1.13× faster than Accelerate with 48-wide hidden layers.**
 
 Empirical opcode probing, fault-tolerant sandboxing, and raw SME instruction emission straight to the silicon.
 
@@ -83,6 +83,7 @@ These parameters were discovered through empirical instruction probing — not f
 | 19 | Cached inference engine — 5× faster than uncached, 0.46× Accelerate | ✅ |
 | 20 | Pre-transposed input — **1.93× faster than Accelerate** | ✅ |
 | 21 | **Tiled GEMM — arbitrary M×N up to 128×128, 5× at 16×16** | ✅ |
+| 22 | **Tiled inference — 784→48→48→10 MLP, 1.13× vs Accelerate** | ✅ |
 
 See [ROADMAP.md](ROADMAP.md) for detailed findings and architecture notes.
 
@@ -103,7 +104,8 @@ src/
   lib.rs               Library crate re-exports for benches
 
 scripts/
-  train_mnist.py       Train MNIST MLP, export weights as raw f32 binaries
+  train_mnist.py       Train 16-wide MNIST MLP, export weights as raw f32 binaries
+  train_mnist_wide.py  Train 48-wide MNIST MLP for tiled inference (Gate 22)
 
 benches/
   crucible_bench.rs    Criterion benchmarks (accelerate vs jit_cold vs jit_hot)
@@ -116,8 +118,9 @@ benches/
 cargo run --release
 
 # Run specific gates
+cargo run --release -- gate22     # Tiled inference (784→48→48→10)
 cargo run --release -- gate21     # Tiled GEMM correctness + benchmark
-cargo run --release -- gate20     # Pre-transposed inference
+cargo run --release -- gate20     # Pre-transposed inference (784→16→16→10)
 cargo run --release -- gate18     # MNIST inference engine
 
 # Rigorous microbenchmark (warmup + percentiles)
