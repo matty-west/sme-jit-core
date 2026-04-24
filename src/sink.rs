@@ -144,6 +144,7 @@ mod tests {
             base: ProbeResult {
                 opcode, faulted: status_faulted, timed_out: false,
                 segfaulted: false, trapped: false, fault_offset: 0,
+                timestamp_pre: 0, timestamp_post: 0,
             },
             pre: Some(GprSnapshot { gprs: [0u64; GPR_COUNT] }),
             post: if status_faulted { None } else { Some(GprSnapshot { gprs: [0u64; GPR_COUNT] }) },

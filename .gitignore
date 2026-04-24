@@ -10,6 +10,9 @@ Cargo.lock
 __pycache__/
 *.pyc
 
+# Model weights (regenerate with: python scripts/train_mnist.py)
+scripts/weights/
+
 # Frida heist outputs (contain extracted proprietary code)
 *.json
 heist/amx_runner

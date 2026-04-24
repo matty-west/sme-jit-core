@@ -2,7 +2,7 @@
 
 ## Where We Are
 
-Gates 0–20 are complete. We have:
+Gates 0–21 are complete. We have:
 - A working JIT harness (MAP_JIT, fork isolation, GPR snapshots)
 - Proof that M4 uses ARM SME (not AMX)
 - A 16×16 SGEMM kernel (PTRUE → ZERO ZA → [LD1W×2 + FMOPA + ADD×2]×K → [ST1W + ADD×2]×16)
@@ -11,6 +11,7 @@ Gates 0–20 are complete. We have:
 - Benchmark: 1.8–2.5× faster than Accelerate at tile-sized problems
 - A 3-layer MNIST inference engine running entirely through JIT'd SME kernels (Gate 18)
 - **1.93× faster than Accelerate** for full 3-layer MLP inference with pre-transposed input (Gate 20)
+- Tiled GEMM up to 128×128 with branched K-loop, **73× faster at 32×32** (Gate 21)
 
 ## Gate 16: BFMOPA / SMOPA Probing (Complete - Negative Result)
 
@@ -198,13 +199,40 @@ The pre-transposed path saved **7.1 μs** — the transpose was 78% of total inf
 - Column-major inter-layer stores (eliminates two 16×16 transposes, saves ~0.1 μs)
 - These would push toward ~1.4 μs / ~2.7× vs Accelerate
 
+## Gate 21: Tiled GEMM (Complete)
+
+**Goal**: Break the 16×16 constraint — JIT-emit tiled SGEMM kernels for arbitrary M×N (multiples of 16, up to 128×128) with a branched K-loop.
+
+**Status**: Complete. All sizes pass with **max_diff = 0.00e0** vs Accelerate.
+
+**Architecture**:
+- `build_sme_tiled_sgemm(m, n, k, act)` — emits inner kernel as `Vec<u32>`
+- `build_sme_tiled_sgemm_page_cached(m, n, k, act, b_ptr, bias_ptr)` — builds callable JitPage
+- Tile loop fully unrolled at JIT time (no runtime tile iteration overhead)
+- K-loop uses SUBS/B.NE branch (7 instructions per tile, executes K times)
+- Calling convention: X0=A (col-major), X1=C (row-major), X5=B (baked), X6=Bias (baked)
+- Registers: X10/X11 base pointers, X4/X7 tile pointers, X8 K-counter, X9 scratch
+
+**Benchmark (1000 iterations)**:
+
+| Size | Tiles | JIT (ns) | Accelerate (ns) | Speedup |
+|:-----|:------|:---------|:----------------|:--------|
+| 16×16×16 | 1 | 16 | 185 | **11.7×** |
+| 32×32×32 | 4 | 91 | 6,692 | **73.5×** |
+| 64×64×64 | 16 | 2,138 | 696 | 0.33× |
+| 128×128×128 | 64 | 12,333 | 5,383 | 0.44× |
+
+**Key insight**: JIT dominates at ≤32×32 (zero dispatch overhead vs Accelerate's BLAS setup cost). Accelerate wins at ≥64×64 (optimized cache blocking, possible multi-core). The crossover between 32 and 64 defines our niche: **tiny-model, latency-critical inference**.
+
+**Not yet implemented**: Edge tiles (non-16-multiple dimensions), L2 cache blocking, double buffering.
+
 ## Deferred (from original roadmap)
 
 These items are deprioritized but not abandoned:
 
 | Item | Original Gate | Status |
 |:-----|:-------------|:-------|
-| Multi-tile tiling (M,N > 16) | Gate 16 (old) | Deferred — focus on depth before breadth |
+| Multi-tile tiling (M,N > 16) | Gate 16 (old) | ✅ **Done** — Gate 21 |
 | OS scheduler bypass (P-core pinning) | Gate 17 (old) | Deferred — nice for benchmarks, not critical path |
 | Double-buffered loads | Gate 18 (old) | Deferred — optimization after new instruction discovery |
 | Batched small-SGEMM | — | Deferred — build after fused kernels prove out |

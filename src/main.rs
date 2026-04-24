@@ -943,6 +943,171 @@ fn gate_20() {
     println!("✓ gate 20 complete\n");
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// Gate 21: Tiled GEMM — Break the 16×16 Constraint
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn gate_21() {
+    use crate::crucible::Crucible;
+    use crate::emitter::{build_sme_tiled_sgemm_page_cached, Activation};
+
+    println!("══════════════════════════════════════════════════════════════");
+    println!("  Gate 21: Tiled GEMM — Break the 16×16 Constraint");
+    println!("══════════════════════════════════════════════════════════════");
+    println!();
+
+    let test_cases: Vec<(usize, usize, usize, &str)> = vec![
+        (16,  16,  16,  "16×16×16 (1 tile, baseline)"),
+        (32,  32,  32,  "32×32×32 (4 tiles)"),
+        (64,  64,  64,  "64×64×64 (16 tiles)"),
+        (128, 128, 128, "128×128×128 (64 tiles)"),
+        (32,  64,  16,  "32×64×16 (rectangular, 8 tiles)"),
+    ];
+
+    let mut all_pass = true;
+
+    for (m, n, k, label) in &test_cases {
+        let m = *m;
+        let n = *n;
+        let k = *k;
+
+        print!("  [{}]  ", label);
+
+        // Generate test data (deterministic pattern with mixed signs)
+        let a_row: Vec<f32> = (0..m * k).map(|i| ((i % 7) as f32) - 3.0).collect();
+        let b_row: Vec<f32> = (0..k * n).map(|i| ((i % 5) as f32) - 2.0).collect();
+
+        // Reference: cblas_sgemm (row-major A × row-major B)
+        let c_ref = Crucible::run_accelerate(m, n, k, &a_row, &b_row);
+
+        // Transpose A: row-major [M×K] → column-major [K panels of M floats]
+        let mut a_col = vec![0.0f32; m * k];
+        for i in 0..m {
+            for j in 0..k {
+                a_col[j * m + i] = a_row[i * k + j];
+            }
+        }
+
+        // Build cached tiled page and execute
+        let mut c_jit = vec![0.0f32; m * n];
+        let page = build_sme_tiled_sgemm_page_cached(
+            m, n, k, Activation::None,
+            b_row.as_ptr() as u64,
+            0,
+        ).expect("Failed to build tiled page");
+
+        // SAFETY: page contains valid kernel, pointers are valid for the given dimensions.
+        unsafe {
+            page.call_with_args(
+                a_col.as_ptr() as u64,
+                c_jit.as_mut_ptr() as u64,
+            );
+        }
+
+        let max_diff = Crucible::max_abs_diff(&c_ref, &c_jit);
+
+        if max_diff < 1e-2 {
+            println!("✓ PASS  max_diff={:.2e}", max_diff);
+        } else {
+            println!("✗ FAIL  max_diff={:.2e}", max_diff);
+            println!("         ref[0..4] = {:?}", &c_ref[0..4.min(c_ref.len())]);
+            println!("         jit[0..4] = {:?}", &c_jit[0..4.min(c_jit.len())]);
+            all_pass = false;
+        }
+    }
+
+    println!();
+
+    // ── Benchmark: tiled JIT vs Accelerate ──
+    println!("  Benchmark (1000 iterations, no activation):");
+    let bench_cases: Vec<(usize, usize, usize)> = vec![
+        (16, 16, 16),
+        (32, 32, 32),
+        (64, 64, 64),
+        (128, 128, 128),
+    ];
+
+    for (m, n, k) in &bench_cases {
+        let m = *m;
+        let n = *n;
+        let k = *k;
+
+        let a_row: Vec<f32> = vec![1.0; m * k];
+        let b_row: Vec<f32> = vec![1.0; k * n];
+
+        // Transpose A for JIT
+        let mut a_col = vec![0.0f32; m * k];
+        for i in 0..m {
+            for j in 0..k {
+                a_col[j * m + i] = a_row[i * k + j];
+            }
+        }
+        let mut c_jit = vec![0.0f32; m * n];
+        let mut c_accel = vec![0.0f32; m * n];
+
+        let page = build_sme_tiled_sgemm_page_cached(
+            m, n, k, Activation::None,
+            b_row.as_ptr() as u64, 0,
+        ).expect("page");
+
+        let iterations = 1000;
+
+        // JIT benchmark
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            // SAFETY: page and buffers are valid.
+            unsafe {
+                page.call_with_args(
+                    a_col.as_ptr() as u64,
+                    c_jit.as_mut_ptr() as u64,
+                );
+            }
+        }
+        let jit_ns = start.elapsed().as_nanos() as f64 / iterations as f64;
+
+        // Accelerate benchmark (pre-allocated output)
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            // SAFETY: valid pointers and correct dimensions.
+            unsafe {
+                crate::crucible::cblas_sgemm(
+                    crate::crucible::CblasOrder::RowMajor,
+                    crate::crucible::CblasTranspose::NoTrans,
+                    crate::crucible::CblasTranspose::NoTrans,
+                    m as i32, n as i32, k as i32,
+                    1.0,
+                    a_row.as_ptr(), k as i32,
+                    b_row.as_ptr(), n as i32,
+                    0.0,
+                    c_accel.as_mut_ptr(), n as i32,
+                );
+            }
+        }
+        let accel_ns = start.elapsed().as_nanos() as f64 / iterations as f64;
+
+        let speedup = accel_ns / jit_ns;
+        println!("    {:>3}×{:>3}×{:>3}:  JIT {:>7.0}ns  Accel {:>7.0}ns  {:.2}×",
+            m, n, k, jit_ns, accel_ns, speedup);
+    }
+
+    println!();
+    if all_pass {
+        println!("  ████████████████████████████████████████████████████████████");
+        println!("  █                                                          █");
+        println!("  █   🧱 GATE 21 — TILED GEMM CORRECTNESS VERIFIED  🧱     █");
+        println!("  █                                                          █");
+        println!("  █   M×N up to 128×128, arbitrary K, branched K-loop        █");
+        println!("  █   All sizes match Accelerate reference                   █");
+        println!("  █                                                          █");
+        println!("  ████████████████████████████████████████████████████████████");
+    } else {
+        println!("  [!] Gate 21 has FAILURES — check output above.");
+    }
+
+    println!();
+    println!("✓ gate 21 complete\n");
+}
+
 fn main() {
     install_sigill_handler();
     
@@ -950,6 +1115,8 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.contains(&"sweep".to_string()) {
         gate_latency_sweep();
+    } else if args.contains(&"gate21".to_string()) {
+        gate_21();
     } else if args.contains(&"gate20".to_string()) {
         gate_20();
     } else if args.contains(&"gate19".to_string()) {
