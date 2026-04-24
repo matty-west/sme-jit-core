@@ -145,6 +145,66 @@ impl CachedInferenceEngine {
         predictions
     }
 
+    /// Run inference with a **pre-transposed** input (Gate 20).
+    ///
+    /// Skips the 784×16 transpose entirely — the input must already be
+    /// in [784×16] column-major layout (as exported by train_mnist.py).
+    ///
+    /// Returns: predictions[16]
+    pub fn run_pretransposed(&mut self, images_t: &[f32]) -> Vec<u8> {
+        assert_eq!(images_t.len(), 784 * 16, "Expected 784×16 pre-transposed input");
+
+        // ── Layer 1: NO TRANSPOSE — use pre-transposed input directly ──
+        unsafe {
+            self.page1.call_with_args(
+                images_t.as_ptr() as u64,
+                self.hidden1.as_mut_ptr() as u64,
+            );
+        }
+
+        // ── Transpose hidden1 (16×16 — only 256 floats, trivial) ──
+        for i in 0..16 {
+            for j in 0..16 {
+                self.hidden1_t[j * 16 + i] = self.hidden1[i * 16 + j];
+            }
+        }
+
+        // ── Layer 2 ──
+        unsafe {
+            self.page2.call_with_args(
+                self.hidden1_t.as_ptr() as u64,
+                self.hidden2.as_mut_ptr() as u64,
+            );
+        }
+
+        // ── Transpose hidden2 ──
+        for i in 0..16 {
+            for j in 0..16 {
+                self.hidden2_t[j * 16 + i] = self.hidden2[i * 16 + j];
+            }
+        }
+
+        // ── Layer 3 ──
+        unsafe {
+            self.page3.call_with_args(
+                self.hidden2_t.as_ptr() as u64,
+                self.output.as_mut_ptr() as u64,
+            );
+        }
+
+        // ── Argmax ──
+        let mut predictions = Vec::with_capacity(16);
+        for i in 0..16 {
+            let row = &self.output[i * 16..i * 16 + 10];
+            let pred = row.iter().enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .map(|(idx, _)| idx as u8)
+                .unwrap_or(0);
+            predictions.push(pred);
+        }
+        predictions
+    }
+
     /// Get the output buffer (16×16, first 10 cols are logits).
     pub fn output(&self) -> &[f32] { &self.output }
     /// Get the hidden1 buffer (16×16).
