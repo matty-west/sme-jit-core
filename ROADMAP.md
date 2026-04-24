@@ -11,7 +11,7 @@ Gates 0–21 are complete. We have:
 - Benchmark: 1.8–2.5× faster than Accelerate at tile-sized problems
 - A 3-layer MNIST inference engine running entirely through JIT'd SME kernels (Gate 18)
 - **1.93× faster than Accelerate** for full 3-layer MLP inference with pre-transposed input (Gate 20)
-- Tiled GEMM up to 128×128 with branched K-loop, **73× faster at 32×32** (Gate 21)
+- Tiled GEMM up to 128×128 with branched K-loop, **5× faster at 16×16** (Gate 21)
 
 ## Gate 16: BFMOPA / SMOPA Probing (Complete - Negative Result)
 
@@ -213,18 +213,64 @@ The pre-transposed path saved **7.1 μs** — the transpose was 78% of total inf
 - Calling convention: X0=A (col-major), X1=C (row-major), X5=B (baked), X6=Bias (baked)
 - Registers: X10/X11 base pointers, X4/X7 tile pointers, X8 K-counter, X9 scratch
 
-**Benchmark (1000 iterations)**:
+**Benchmark (2000 samples, 500 warmup, median ns/call)**:
 
-| Size | Tiles | JIT (ns) | Accelerate (ns) | Speedup |
-|:-----|:------|:---------|:----------------|:--------|
-| 16×16×16 | 1 | 16 | 185 | **11.7×** |
-| 32×32×32 | 4 | 91 | 6,692 | **73.5×** |
-| 64×64×64 | 16 | 2,138 | 696 | 0.33× |
-| 128×128×128 | 64 | 12,333 | 5,383 | 0.44× |
+| Size | Tiles | JIT median | Accel median | Speedup |
+|:-----|:------|:-----------|:-------------|:--------|
+| 16×16×16 | 1 | 41 ns | 208 ns | **5.1×** |
+| 32×32×32 | 4 | 83 ns | 250 ns | **3.0×** |
+| 48×48×48 | 9 | 333 ns | 459 ns | **1.4×** |
+| 64×64×64 | 16 | 834 ns | 667 ns | 0.8× |
+| 128×128×128 | 64 | 7,750 ns | 3,000 ns | 0.4× |
 
-**Key insight**: JIT dominates at ≤32×32 (zero dispatch overhead vs Accelerate's BLAS setup cost). Accelerate wins at ≥64×64 (optimized cache blocking, possible multi-core). The crossover between 32 and 64 defines our niche: **tiny-model, latency-critical inference**.
+> **Note**: An earlier benchmark without warmup showed 73× at 32×32 — this was a cold-start artifact.
+> Accelerate's first call at each size pays a one-time ~6,600ns setup cost for internal buffer
+> allocation and code path selection. After warmup, its dispatch tax is a flat **~200ns** regardless
+> of matrix size.
+
+**Key insight**: JIT dominates at ≤48×48 (zero dispatch overhead vs Accelerate's ~200ns fixed tax). Accelerate wins at ≥64×64 (optimized cache blocking, possible multi-core). The crossover at ~48×48 defines our niche: **tiny-model, latency-critical inference**.
 
 **Not yet implemented**: Edge tiles (non-16-multiple dimensions), L2 cache blocking, double buffering.
+
+## Gate 22: Tiled Inference Engine (Next)
+
+**Goal**: Replace the 16×16-only `CachedInferenceEngine` with the tiled GEMM infrastructure from Gate 21 — enable wider hidden layers and bigger models.
+
+**Why**: Gate 20's MNIST engine is locked to 16-wide hidden layers (one ZA tile). Real models need 64, 128, 256+ hidden dimensions. Gate 21 proved tiled GEMM works up to 128×128. Now wire it into the inference engine.
+
+**Build plan**:
+1. Retrain MNIST with wider layers: 784→64→64→10 (or 784→128→64→10)
+2. Update `CachedInferenceEngine` to use `build_sme_tiled_sgemm_page_cached` for all layers
+3. Correctness: differential test vs Accelerate reference (same as Gate 18)
+4. Benchmark: compare tiled JIT inference vs Accelerate at wider hidden dims
+5. Find the model-size sweet spot where JIT still beats Accelerate end-to-end
+
+**Expected outcome**: JIT should still win at 64-wide hidden layers (48×48 crossover) but lose at 128-wide. This tells us exactly how big a model we can run faster than Apple.
+
+## Gate 23: Single Streaming Session (Optimization)
+
+**Goal**: Emit a single SMSTART/SMSTOP wrapping all layers instead of one per kernel call — eliminate mode switch overhead.
+
+**Why**: Each SMSTART/SMSTOP pair costs ~50-100ns. With 3 layers, that's 6 mode switches = ~300-600ns of pure overhead. Gate 20 runs at 2.0μs — this is 15-30% of total time.
+
+**Approach**:
+1. Build a `ChainedInferenceEngine` that emits all 3 layers into a single JitPage
+2. SMSTART once → Layer 1 FMOPA+store → transpose in-place → Layer 2 → ... → SMSTOP once
+3. Challenge: inter-layer transpose must happen *inside* streaming mode (SVE LD1W/ST1W work, confirmed Gate 17)
+4. Alternative: emit column-major ST1W so next layer's LD1W reads columns directly (eliminates transpose entirely)
+
+**Expected outcome**: ~1.4 μs inference → ~2.7× vs Accelerate.
+
+## Gate 24: Publish & Document
+
+**Goal**: Package the project for public consumption — blog post, clean API, reproducible benchmarks.
+
+**Deliverables**:
+1. Blog post: "Beating Accelerate.framework on M4: A JIT SME Adventure"
+2. Clean public API: `SmeGemm::new(m, n, k) → kernel.run(a, b, c)`
+3. Criterion benchmarks updated for all gate results
+4. GitHub Actions CI (build-only, M4 hardware not available in CI)
+5. Crate documentation with architecture diagrams
 
 ## Deferred (from original roadmap)
 
