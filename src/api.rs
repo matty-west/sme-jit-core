@@ -24,7 +24,11 @@
 //! ```rust,no_run
 //! use sme_jit_core::api::{SmeMlp, LayerConfig, Activation};
 //!
-//! let mlp = SmeMlp::new(784, &[
+//! # let (w1, b1) = (vec![0.0f32; 784 * 48], vec![0.0f32; 48]);
+//! # let (w2, b2) = (vec![0.0f32; 48 * 48],  vec![0.0f32; 48]);
+//! # let (w3, b3) = (vec![0.0f32; 48 * 16],  vec![0.0f32; 16]);
+//! # let input_col_major = vec![0.0f32; 784 * 16];
+//! let mut mlp = SmeMlp::new(784, &[
 //!     LayerConfig { n: 48, weights: w1, bias: b1, activation: Activation::BiasReLU },
 //!     LayerConfig { n: 48, weights: w2, bias: b2, activation: Activation::BiasReLU },
 //!     LayerConfig { n: 16, weights: w3, bias: b3, activation: Activation::Bias },

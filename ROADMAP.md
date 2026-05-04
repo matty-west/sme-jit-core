@@ -2,7 +2,7 @@
 
 ## Where We Are
 
-Gates 0–24 are complete. We have transitioned from the **Discovery Phase** (empirical probing) to the **Maturation Phase** (API stability and architectural scaling).
+Gates 0–24, 26–27 are complete. We have transitioned from the **Discovery Phase** (empirical probing) to the **Maturation Phase** (API stability and architectural scaling).
 
 ### Status Summary
 - **Proven Performance:** 1.55× faster than Accelerate for full MNIST MLPs; 5.1× for 16×16 tiles.
@@ -426,9 +426,34 @@ The garbage encoding (`0x2591_107x`) decoded as undefined SVE, executed silently
 - Undefined SVE encodings execute silently as NOPs on M4 (no SIGILL) — masking bugs that would fault-fast on stricter hardware.
 - `LD1W`/`ST1W` with a fully-zero predicate are clean no-ops (no fault, no transfer).
 
-### Gate 27: Predicated Outer Products
+### Gate 27: Predicated Outer Products (Complete)
 **Goal:** Handle the K-loop tail by emitting `FMOPA` with properly masked predicate registers to zero out inactive MAC units.
-**Success:** Compute a dot-product of odd length exactly matching scalar reference.
+**Status:** ✅ **Complete.**
+
+**Results:**
+
+| K | Label | Expected | Got | Diff | Cols masked |
+|:--|:------|:---------|:----|:-----|:------------|
+| 1 | trivial | −0.1000 | −0.1000 | 0.00e0 | ✓ |
+| 7 | odd, prime | 7.2000 | 7.2000 | 0.00e0 | ✓ |
+| 13 | prime | 62.6000 | 62.6000 | 0.00e0 | ✓ |
+| 16 | full SVE width | 122.4000 | 122.4000 | 0.00e0 | ✓ |
+| 31 | odd, prime | 934.0000 | 934.0000 | 0.00e0 | ✓ |
+| 100 | larger | 32825.0078 | 32825.0078 | 0.00e0 | ✓ |
+
+`ZA[0][1..15] = 0.0` for all K — confirming `FMOPA P1/M, P1/M` accumulates only into `ZA[0][0]`.
+
+**Encoder bug fixed:**
+`encode_sme_st1w_za_h` used `pg << 11` for the predicate field. Correct position is bits **12–10** (`pg << 10`), matching SVE LD1W/ST1W. Silent for P0 (zero in any position = 0), wrong for P1+. Pinned with `st1w_za_h_pg_field` unit test.
+
+**`encode_sme_fmopa` added:**
+Parametric encoder for `FMOPA ZAda.S, Pn/M, Pm/M, Zn.S, Zm.S`. Replaces four hard-coded `0x8081_0000` constants throughout the kernel builders. Pinned with `fmopa_encoding` unit test covering three reference values.
+
+**M4 SME discoveries:**
+- **SMSTART resets predicates to all-false.** Every kernel must emit `PTRUE P0.S` (and any other predicates in use) immediately after SMSTART. Kernels that rely on P0 for LD1W/ST1W without initialising it will silently produce all-zero output. Confirmed by gate27 initially outputting `c[0]=0.0` for all K; fixed by adding `PTRUE_P0_S` to prologue.
+- **`FMOPA ZA0.S, Pn/M, Pm/M, Zn, Zm` with non-trivial predicates works correctly.** Only ZA entries where both row-predicate (Pn) and col-predicate (Pm) lanes are active get updated. ✓
+- **`FMOPA P1/M, P1/M` modifies P1 as a side effect** after the first call on M4. ARM spec says predicates are read-only inputs to FMOPA — this is an undocumented M4 deviation. Workaround: re-run `WHILELT Pn` at the top of each FMOPA iteration to restore the mask.
+- **Predicated ZA stores (`ST1W ZA0H, Pg≠P0`) behave unexpectedly** after ≥2 FMOPA iterations (writes more lanes than predicate specifies). Root cause unknown. Workaround: use P0 (all-true) for ZA extraction; mask output in the caller if needed.
 
 ### Gate 28: Arbitrary Tiled GEMM
 **Goal:** Integrate Gates 26 and 27 into the main `SmeGemm` tiled architecture.

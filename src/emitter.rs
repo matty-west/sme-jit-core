@@ -174,12 +174,40 @@ pub const fn encode_sme_st1w_za_h(wv: u8, off2: u8, pg: u8, rn: u8, rm: u8) -> u
     assert!(pg   <= 7,  "predicate register must be P0–P7");
     assert!(rn   <= 30, "base register must be X0–X30");
     assert!(rm   <= 30, "offset register must be X0–X30");
+    // Pg field is at bits 12–10 (empirically confirmed via probe sweep; Gate 27).
+    // Silent for pg=0 (zero anywhere = zero), wrong for pg≥1 at bits 13–11.
     0xE0A0_0000
         | ((rm   as u32) << 16)
-        | ((pg   as u32) << 11)
+        | ((pg   as u32) << 10)
         | ((rn   as u32) <<  5)
         | ((wv   as u32) <<  3)
         | ((off2 as u32) <<  1)
+}
+
+/// `FMOPA ZAda.S, Pn/M, Pm/M, Zn.S, Zm.S` — FP32 outer-product accumulate.
+///
+/// ZAda ∈ 0..3 (ZA tile index), Pn/Pm ∈ 0..7 (row/col predicate).
+/// Only ZA entries where both the row-predicate (Pn) and col-predicate (Pm) lane
+/// are active get updated. Accumulates into the existing ZAda contents.
+///
+/// Field layout (base 0x8080_0000):
+/// - bits 20..16 = Zm
+/// - bits 15..13 = Pm
+/// - bits 12..10 = Pn
+/// - bits  9..5  = Zn
+/// - bits   1..0 = ZAda
+pub const fn encode_sme_fmopa(zada: u8, zn: u8, zm: u8, pn: u8, pm: u8) -> u32 {
+    assert!(zada <= 3,  "ZAda must be 0–3 for FP32");
+    assert!(zn   <= 31, "Zn must be 0–31");
+    assert!(zm   <= 31, "Zm must be 0–31");
+    assert!(pn   <= 7,  "Pn must be 0–7");
+    assert!(pm   <= 7,  "Pm must be 0–7");
+    0x8080_0000
+        | ((zm   as u32) << 16)
+        | ((pm   as u32) << 13)
+        | ((pn   as u32) << 10)
+        | ((zn   as u32) <<  5)
+        | (zada  as u32)
 }
 
 /// `ADD Xd, Xn, #imm12` — 64-bit immediate add, no shift.
@@ -344,7 +372,7 @@ pub fn build_sme_sgemm_16x16(k: usize, act: Activation) -> Vec<u32> {
 
     let ld1w_z0_x4 = encode_sve_ld1w_ss(0, 0, 4, 3);
     let ld1w_z1_x5 = encode_sve_ld1w_ss(1, 0, 5, 3);
-    let fmopa_za0  = 0x8081_0000_u32; 
+    let fmopa_za0  = encode_sme_fmopa(0, 0, 1, 0, 0);
     let add_x4_svl = encode_add_x_imm(4, 4, SVL_BYTES);
     let add_x5_svl = encode_add_x_imm(5, 5, SVL_BYTES);
 
@@ -535,7 +563,7 @@ pub fn build_sme_tiled_sgemm(m: usize, n: usize, k: usize, act: Activation) -> V
     // ── Pre-encode reusable instructions ──
     let ld1w_z0_x4  = encode_sve_ld1w_ss(0, 0, 4, 3);    // Z0 ← [X4, X3, LSL #2]
     let ld1w_z1_x7  = encode_sve_ld1w_ss(1, 0, 7, 3);    // Z1 ← [X7, X3, LSL #2]
-    let fmopa_za0   = 0x8081_0000u32;                      // ZA0 += Z0 ⊗ Z1
+    let fmopa_za0   = encode_sme_fmopa(0, 0, 1, 0, 0);
     let add_x4_a    = encode_add_x_imm(4, 4, a_k_stride); // X4 += M*4
     let add_x7_b    = encode_add_x_imm(7, 7, b_k_stride); // X7 += N*4
     let subs_x8_1   = encode_subs_x_imm(8, 8, 1);         // X8 -= 1, set flags
@@ -858,7 +886,7 @@ fn build_layer_kernel(
     // Pre-encode reusable instructions
     let ld1w_z0_x4  = encode_sve_ld1w_ss(0, 0, 4, 3);    // Z0 ← A[X4]
     let ld1w_z1_x7  = encode_sve_ld1w_ss(1, 0, 7, 3);    // Z1 ← B[X7]
-    let fmopa_za0   = 0x8081_0000u32;                      // ZA0 += Z0 ⊗ Z1
+    let fmopa_za0   = encode_sme_fmopa(0, 0, 1, 0, 0);
     let add_x4_a    = encode_add_x_imm(4, 4, a_k_stride);
     let add_x7_b    = encode_add_x_imm(7, 7, b_k_stride);
     let subs_x8_1   = encode_subs_x_imm(8, 8, 1);
@@ -1165,7 +1193,7 @@ pub fn build_monolithic_inference_page(
 
         let ld1w_z0_x4 = encode_sve_ld1w_ss(0, 0, 4, 3);
         let ld1w_z1_x7 = encode_sve_ld1w_ss(1, 0, 7, 3);
-        let fmopa_za0 = 0x8081_0000u32;
+        let fmopa_za0 = encode_sme_fmopa(0, 0, 1, 0, 0);
         let add_x4_a = encode_add_x_imm(4, 4, a_k_stride);
         let add_x7_b = encode_add_x_imm(7, 7, b_k_stride);
         let subs_x8_1 = encode_subs_x_imm(8, 8, 1);
@@ -1414,6 +1442,67 @@ pub fn build_gate26_page(limit: usize) -> Option<crate::jit_page::JitPage> {
         off += 4;
     }
 
+    page.make_executable();
+    Some(page)
+}
+
+/// Build a JIT page for Gate 27: predicated FMOPA dot product.
+///
+/// Computes `c[0] = Σ a[i]·b[i]` for `i in 0..k` using FMOPA with P1 = lane-0-only
+/// predicate. `c[1..15]` remain 0.0, proving `FMOPA Pn/M, Pm/M` only updates ZA
+/// entries where both row-predicate and col-predicate lanes are active.
+///
+/// All three pointers are baked into the instruction stream; call with `call_void()`.
+///
+/// # Key M4 quirk
+/// `FMOPA P1/M` modifies P1 as a side effect on M4 (undocumented). The workaround is
+/// to re-emit `WHILELT P1.S, X14, X15` at the top of each loop iteration.
+pub fn build_gate27_page(k: usize, a_ptr: u64, b_ptr: u64, c_ptr: u64)
+    -> Option<crate::jit_page::JitPage>
+{
+    assert!(k >= 1 && k <= 65535, "k must be 1..=65535");
+
+    let mut insns: Vec<u32> = Vec::with_capacity(64);
+
+    // Bake all three pointers: X0=a, X1=b, X2=c
+    insns.extend(emit_load_imm64_vec(0, a_ptr));
+    insns.extend(emit_load_imm64_vec(1, b_ptr));
+    insns.extend(emit_load_imm64_vec(2, c_ptr));
+    // X3=0 (element index), X8=k (counter), X14=0, X15=1
+    insns.push(encode_mov_xzr(3));
+    insns.push(encode_movz_x(8, k as u16, 0));
+    insns.push(encode_movz_x(14, 0, 0));
+    insns.push(encode_movz_x(15, 1, 0));
+
+    insns.push(SMSTART);
+    insns.push(PTRUE_P0_S);  // P0 = all-true; SMSTART resets predicates to 0
+    insns.push(ZERO_ZA);
+
+    // ── Loop body: 7 instructions, BNE at [6] → [0] = −24 bytes ──
+    // [0] Re-issue WHILELT each iter: FMOPA P1/M corrupts P1 on M4 (undocumented).
+    insns.push(encode_sve_whilelt_s(1, 14, 15));        // [0] P1 = {T,F,F,...,F}
+    insns.push(encode_sve_ld1w_ss(0, 1, 0, 3));         // [1] Z0 ← a[X3]  (P1/Z)
+    insns.push(encode_sve_ld1w_ss(1, 1, 1, 3));         // [2] Z1 ← b[X3]  (P1/Z)
+    insns.push(encode_sme_fmopa(0, 0, 1, 1, 1));        // [3] ZA0[0][0] += Z0[0]*Z1[0]
+    insns.push(encode_add_x_imm(3, 3, 1));              // [4] X3 += 1
+    insns.push(encode_subs_x_imm(8, 8, 1));             // [5] X8 -= 1, set flags
+    insns.push(encode_b_ne(-6 * 4));                    // [6] B.NE [0]
+
+    // ── Epilogue: extract row 0 via P0 (all-true), write 16 floats ──
+    // Use P0 for ZA store: predicated ZA stores misbehave after ≥2 FMOPAs on M4.
+    insns.push(encode_movz_x(12, 0, 0));                // W12 = 0 → ZA0H.S[W12,#0] = row 0
+    insns.push(encode_mov_xzr(3));                      // X3 = 0 (store offset)
+    insns.push(encode_sme_st1w_za_h(0, 0, 0, 2, 3));   // ST1W ZA0H[W12,#0], P0, [X2,X3,LSL#2]
+    insns.push(SMSTOP);
+    insns.push(RET);
+
+    let total_bytes = insns.len() * 4;
+    let page_size = ((total_bytes + 16383) / 16384) * 16384;
+    let page = crate::jit_page::JitPage::alloc(page_size).ok()?;
+    page.make_writable();
+    for (i, &op) in insns.iter().enumerate() {
+        page.write_instruction(i * 4, op);
+    }
     page.make_executable();
     Some(page)
 }
@@ -1750,5 +1839,24 @@ mod tests {
         page.make_writable();
         let end = emit_prelude(&page, buf.as_mut_ptr(), true, &[], false);
         assert!(end < 4096 - 256, "prelude (streaming) used {end} bytes, not enough room");
+    }
+
+    #[test]
+    fn fmopa_encoding() {
+        // Verified against known M4 instruction stream:
+        // - baseline: FMOPA ZA0.S, P0/M, P0/M, Z0.S, Z1.S (zm=1, all predicates P0)
+        assert_eq!(encode_sme_fmopa(0, 0, 1, 0, 0), 0x8081_0000);
+        // - P1/M row+col predicates: pn=1 (<<10 = 0x400), pm=1 (<<13 = 0x2000)
+        assert_eq!(encode_sme_fmopa(0, 0, 1, 1, 1), 0x8081_2400);
+        // - arbitrary fields: zada=1, zn=4, zm=5, pn=2, pm=3
+        assert_eq!(encode_sme_fmopa(1, 4, 5, 2, 3), 0x8085_6881);
+    }
+
+    #[test]
+    fn st1w_za_h_pg_field() {
+        // pg=1 must set bit 10, not bit 11 (Pg field is at bits 12–10)
+        let enc = encode_sme_st1w_za_h(0, 0, 1, 2, 3);
+        assert_eq!(enc & (1 << 10), 1 << 10, "Pg bit 10 should be set for pg=1");
+        assert_eq!(enc & (1 << 11), 0,       "Bit 11 must be clear for pg=1");
     }
 }
