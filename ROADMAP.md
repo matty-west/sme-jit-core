@@ -1,5 +1,19 @@
 # sme-jit-core Roadmap
 
+## Publication
+
+An arXiv pre-print is in preparation. See [`MANUSCRIPT.md`](MANUSCRIPT.md) for the full plan.
+
+**Title:** *Reverse-Engineering Apple M4 SME: Bare-Metal JIT Acceleration for Latency-Critical Edge AI*
+**Target:** `cs.AR` (primary), `cs.PF` (cross-list)
+
+**Blocking data gaps before submission:**
+- Edge-tile timing benchmark: `SmeGemm` at non-16-multiple sizes (17×43×K, 31×31×K, 100×100×K) vs Accelerate — the only missing dataset.
+- Rectangle shapes in the tiled sweep (784×48, 48×10 configurations).
+- p50/p95/p99 latency distributions extracted from existing Criterion output in `target/criterion/`.
+
+---
+
 ## Where We Are
 
 Gates 0–24, 26–28 are complete. We have transitioned from the **Discovery Phase** (empirical probing) through the **Maturation Phase** (API stability) and are now entering the **Sequence Phase** — building the primitives needed for modern small-model inference (transformers, SSMs, RNNs).
@@ -9,6 +23,7 @@ Gates 0–24, 26–28 are complete. We have transitioned from the **Discovery Ph
 - **Architectural Milestone:** Monolithic kernel fusion, zero-transpose vertical stores, and arbitrary M×N×K via WHILELT-predicated edge tiles (Gate 28).
 - **Strategic Pivot (post-Gate-28):** Multi-threading was dropped from the roadmap after we confirmed our niche is *zero-dispatch low-latency batch=1 inference* — fighting Accelerate at large GEMM is its home turf. The new direction is sequence-model primitives, with **GEMV first** (because batch=1 ZA tile utilization is currently 6%) followed by horizontal reductions (Softmax/Norms) and SSM/Mamba scans.
 - **Codebase Maturation (Active):** Trimmed `signal_handler.rs` (SIGTRAP/SIGINT handlers, timer helpers, dead flag getters) and `emitter.rs` (`build_layer_kernel`, `ESTIMATED_OVERHEAD_BYTES`, ~10 inline-hex sites collapsed to shared `PTRUE_P2_S`/`PTRUE_P3_S`/`DUP_Z4_ZERO` constants).
+- **Publication (Active):** arXiv pre-print in preparation — see [`MANUSCRIPT.md`](MANUSCRIPT.md). Headline finding: confirmed ARM SME spec deviation on M4 (`FMOPA` with same-register row/col predicate corrupts that register). Edge-tile timing benchmarks are the blocking data gap.
 
 ### Functional Progress
 - A working JIT harness (MAP_JIT, fork isolation, GPR snapshots)
